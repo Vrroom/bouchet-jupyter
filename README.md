@@ -13,8 +13,6 @@ similar that's running inside the same job.
 
 ## Install
 
-### Laptop
-
 ```
 ln -s "$PWD/bouchet-jupyter" ~/bin/bouchet-jupyter
 mkdir -p ~/.config/bouchet-jupyter
@@ -37,19 +35,6 @@ Host bouchet
     ControlPath ~/.ssh/cm-%r@%h:%p
     ControlPersist 8h
 ```
-
-### Cluster
-
-Drop the sbatch script wherever your config's `sbatch_dir` points:
-
-```
-ssh bouchet 'mkdir -p ~/SlurmScripts'
-scp jupyter_launch.sh bouchet:~/SlurmScripts/
-```
-
-Edit the `#SBATCH --account=...` line in the script to match your
-allocation. Resource flags (partition, gpus, cpus, mem, time) come from
-the laptop's chosen profile, so you don't set them in the script.
 
 ## Use
 

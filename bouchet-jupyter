@@ -1,0 +1,1236 @@
+#!/usr/bin/env python3
+"""bouchet-jupyter — launch / tear down JupyterLab sessions on Bouchet.
+
+Run `bouchet-jupyter --help` for usage. Config lives at
+~/.config/bouchet-jupyter/config.toml; on first run an existing bash-style
+config in the same directory is migrated automatically.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import tomllib  # Python 3.11+ stdlib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]  # pip install --user tomli
+    except ImportError:
+        sys.stderr.write(
+            "bouchet-jupyter needs a TOML reader. On Python 3.11+ this is stdlib;\n"
+            "on older Pythons run: pip install --user tomli\n"
+        )
+        sys.exit(1)
+
+
+def _toml_load(path: Path) -> dict:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+
+BUILTIN_PROFILES: dict[str, dict] = {
+    "gpu": {"partition": "gpu_h200", "gpus": "h200:1", "cpus": 8, "mem": "64G", "time": "08:00:00"},
+    "cpu": {"partition": "day",      "gpus": "",       "cpus": 8, "mem": "32G", "time": "08:00:00"},
+}
+
+DEFAULTS = {
+    "host":              "bouchet",
+    "local_port":        8888,
+    "sbatch_dir":        "$HOME/project_pi_jd374/sc3344/SlurmScripts",
+    "sbatch_file":       "jupyter_launch.sh",
+    "log_dir":           "$HOME/project_pi_jd374/sc3344/SlurmScripts/job_logs",
+    "state_remote_dir":  "$HOME/.jupyter-cluster",
+    "default_profile":   "gpu",
+    "env_cmd":           "",
+}
+
+CONFIG_DIR    = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "bouchet-jupyter"
+CONFIG_TOML   = CONFIG_DIR / "config.toml"
+CONFIG_LEGACY = CONFIG_DIR / "config"
+STATE_DIR     = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "bouchet-jupyter"
+
+POLL_START   = 3
+POLL_MAX     = 60
+SSH_TIMEOUT  = 15
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+class Config:
+    def __init__(self, data: dict):
+        self.data = data
+        for k, v in DEFAULTS.items():
+            setattr(self, k, data.get(k, v))
+        self.local_port = int(self.local_port)
+        # Merge user profiles on top of built-ins, key-by-key.
+        self.profiles: dict[str, dict] = {k: dict(v) for k, v in BUILTIN_PROFILES.items()}
+        for name, p in (data.get("profiles") or {}).items():
+            base = self.profiles.get(name, {})
+            base.update(p)
+            self.profiles[name] = base
+        self.overrides: dict = data.get("overrides") or {}
+
+    @classmethod
+    def load(cls) -> "Config":
+        if CONFIG_LEGACY.exists() and not CONFIG_TOML.exists():
+            migrate_bash_config()
+        data: dict = {}
+        if CONFIG_TOML.exists():
+            data = _toml_load(CONFIG_TOML)
+        return cls(data)
+
+    def resolve_profile(self, name: str) -> dict:
+        if name not in self.profiles:
+            avail = ", ".join(sorted(self.profiles))
+            die(f"unknown profile: {name}\navailable: {avail}")
+        merged = dict(self.profiles[name])
+        for k in ("partition", "gpus", "cpus", "mem", "time"):
+            v = self.overrides.get(k)
+            if v not in (None, ""):
+                merged[k] = v
+        return merged
+
+
+def migrate_bash_config() -> None:
+    """Parse the legacy bash-sourced config into TOML.
+
+    Conservative line-by-line parser (we don't shell-source it — the values
+    contain literal `$HOME` that must survive into the TOML untouched).
+    Recognized keys: top-level DEFAULTS, ad-hoc PARTITION/GPUS/CPUS/MEM/TIME,
+    and PROFILE_<name>_<KEY>. Anything else is ignored with a notice.
+    """
+    top_keys = {k.upper(): k for k in DEFAULTS}
+    override_keys = {"PARTITION", "GPUS", "CPUS", "MEM", "TIME"}
+    profile_re = re.compile(r"^PROFILE_([A-Za-z][A-Za-z0-9]*)_(PARTITION|GPUS|CPUS|MEM|TIME)$")
+    kv_re      = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*?)\s*(?:#.*)?$")
+
+    top: dict = {}
+    overrides: dict = {}
+    profiles: dict[str, dict] = {}
+    skipped: list[str] = []
+
+    for raw in CONFIG_LEGACY.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = kv_re.match(raw)
+        if not m:
+            continue
+        k, v = m.group(1), m.group(2)
+        # Strip matched outer quotes (single or double).
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        if v == "":
+            continue
+        if k in top_keys:
+            top[top_keys[k]] = int(v) if top_keys[k] == "local_port" else v
+        elif k in override_keys:
+            overrides[k.lower()] = v
+        elif (pm := profile_re.match(k)):
+            pname, pkey = pm.group(1), pm.group(2).lower()
+            profiles.setdefault(pname, {})[pkey] = int(v) if pkey == "cpus" else v
+        else:
+            skipped.append(k)
+
+    # Render TOML by hand (small, tomllib is read-only).
+    out: list[str] = []
+    out.append("# Migrated from ~/.config/bouchet-jupyter/config")
+    out.append(f"# on {datetime.now().isoformat(timespec='seconds')}")
+    out.append("")
+    for k in DEFAULTS:
+        if k in top:
+            out.append(f"{k} = {_toml_value(top[k])}")
+    if overrides:
+        out.append("")
+        out.append("[overrides]")
+        for k in ("partition", "gpus", "cpus", "mem", "time"):
+            if k in overrides:
+                out.append(f"{k} = {_toml_value(overrides[k])}")
+    for pname, pdata in profiles.items():
+        out.append("")
+        out.append(f"[profiles.{pname}]")
+        for k in ("partition", "gpus", "cpus", "mem", "time"):
+            if k in pdata:
+                out.append(f"{k} = {_toml_value(pdata[k])}")
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_TOML.write_text("\n".join(out) + "\n")
+    backup = CONFIG_LEGACY.with_suffix(".bak")
+    CONFIG_LEGACY.rename(backup)
+    print(f"migrated: {CONFIG_LEGACY} -> {CONFIG_TOML} (old kept as {backup.name})", file=sys.stderr)
+    if skipped:
+        print(f"  ignored unrecognized keys: {', '.join(skipped)}", file=sys.stderr)
+
+
+def _toml_value(v) -> str:
+    if isinstance(v, bool):  return "true" if v else "false"
+    if isinstance(v, int):   return str(v)
+    return '"' + str(v).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+# ---------------------------------------------------------------------------
+# SSH wrapper
+# ---------------------------------------------------------------------------
+
+class SSHError(RuntimeError):
+    pass
+
+
+class SSH:
+    """Thin wrapper around `ssh HOST <command>`. Relies on ControlMaster in
+    ~/.ssh/config for connection multiplexing."""
+
+    def __init__(self, host: str):
+        self.host = host
+
+    def run(self, cmd: str, *, check: bool = True, timeout: int = SSH_TIMEOUT,
+            input_data: str | None = None, retry: bool = True) -> str:
+        argv = ["ssh", self.host, cmd]
+        last_err = ""
+        for attempt in range(2 if retry else 1):
+            try:
+                r = subprocess.run(argv, capture_output=True, text=True,
+                                   input=input_data, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                last_err = f"ssh timeout after {timeout}s"
+                continue
+            if r.returncode == 0:
+                return r.stdout.rstrip("\n")
+            last_err = (r.stderr or r.stdout).strip()
+            transient = ("Connection closed" in last_err or
+                         "Connection reset" in last_err or
+                         "kex_exchange" in last_err)
+            if not transient or attempt > 0:
+                break
+        if check:
+            raise SSHError(f"ssh `{cmd}` failed: {last_err}")
+        return ""
+
+    def forward(self, spec: str) -> None:
+        # Touch the master first so -O has something to talk to.
+        subprocess.run(["ssh", self.host, "true"], check=True, timeout=SSH_TIMEOUT)
+        r = subprocess.run(["ssh", "-O", "forward", "-L", spec, self.host],
+                           capture_output=True, text=True, timeout=SSH_TIMEOUT)
+        if r.returncode != 0:
+            raise SSHError(f"tunnel forward failed: {(r.stderr or r.stdout).strip()}")
+
+    def cancel_forward(self, spec: str) -> None:
+        subprocess.run(["ssh", "-O", "cancel", "-L", spec, self.host],
+                       capture_output=True, text=True, timeout=SSH_TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
+# Slurm queries
+# ---------------------------------------------------------------------------
+
+class Slurm:
+    def __init__(self, ssh: SSH):
+        self.ssh = ssh
+
+    def nodes(self) -> list["Node"]:
+        out = self.ssh.run("scontrol show node -o", timeout=30)
+        return [Node.parse(line) for line in out.splitlines() if line.strip()]
+
+    def my_pending(self) -> list[dict]:
+        out = self.ssh.run("squeue --me -t PD -h -o '%i|%j|%P|%R|%Q'", timeout=15)
+        rows = []
+        for line in out.splitlines():
+            parts = line.split("|")
+            if len(parts) < 5:
+                continue
+            rows.append({"job_id": parts[0], "name": parts[1], "partition": parts[2],
+                         "reason": parts[3].strip("()"), "priority": parts[4]})
+        return rows
+
+    def start_estimate(self, job_id: str) -> dict | None:
+        out = self.ssh.run(f"squeue -j {shlex.quote(job_id)} --start -h -o '%S|%R|%Q|%P'",
+                           timeout=15, check=False)
+        if not out.strip():
+            return None
+        parts = out.strip().splitlines()[0].split("|")
+        if len(parts) < 4:
+            return None
+        return {"start": parts[0], "reason": parts[1].strip("()"),
+                "priority": parts[2], "partition": parts[3]}
+
+    def submit(self, sbatch_dir: str, sbatch_file: str, sbatch_flags: list[str],
+               session_name: str, state_remote_dir: str) -> str:
+        """Submit and return JOB_ID, with double-capture for race resilience.
+
+        Paths (state_remote_dir / sbatch_dir) carry literal `$HOME` from config —
+        keep them unquoted so the remote shell expands them. session_name is
+        validated upstream (see _validate_name)."""
+        marker = f"{state_remote_dir}/last-submit.{session_name}.id"
+        flags  = " ".join(shlex.quote(f) for f in sbatch_flags)
+        cmd = (f"mkdir -p {state_remote_dir} && rm -f {marker} && "
+               f"cd {sbatch_dir} && "
+               f"sbatch --parsable --export=ALL,JC_SESSION={shlex.quote(session_name)} "
+               f"{flags} {shlex.quote(sbatch_file)} | tee {marker}")
+        out = self.ssh.run(cmd, timeout=30)
+        job_id = (out.strip().splitlines() or [""])[-1].strip()
+        if not job_id.isdigit():
+            recovered = self.ssh.run(f"cat {marker} 2>/dev/null", check=False).strip()
+            if recovered.isdigit():
+                job_id = recovered
+        if not job_id.isdigit():
+            raise SSHError(f"could not parse JOB_ID (stdout={out!r})")
+        return job_id
+
+    def cancel(self, job_id: str) -> None:
+        self.ssh.run(f"scancel {shlex.quote(job_id)}", check=False)
+
+    def state(self, job_id: str) -> str:
+        return self.ssh.run(f"squeue -h -j {shlex.quote(job_id)} -o '%T %R'", check=False).strip()
+
+    def final_state(self, job_id: str) -> str:
+        return self.ssh.run(f"sacct -j {shlex.quote(job_id)} -X -P -n -o State 2>/dev/null | head -1",
+                            check=False).strip()
+
+
+# ---------------------------------------------------------------------------
+# Node parsing
+# ---------------------------------------------------------------------------
+
+GRES_GPU_RE = re.compile(r"gpu:([A-Za-z0-9_]+):(\d+)")
+ALLOC_GPU_TYPED_RE = re.compile(r"gres/gpu:([A-Za-z0-9_]+)=(\d+)")
+ALLOC_GPU_TOTAL_RE = re.compile(r"gres/gpu=(\d+)")
+
+
+class Node:
+    """Parsed `scontrol show node -o` line."""
+    __slots__ = ("name", "state", "flags", "partitions", "cpu_alloc", "cpu_tot",
+                 "real_mem_mb", "alloc_mem_mb", "gpu_type", "gpu_total", "gpu_alloc")
+
+    def __init__(self, name, state, flags, partitions, cpu_alloc, cpu_tot,
+                 real_mem_mb, alloc_mem_mb, gpu_type, gpu_total, gpu_alloc):
+        self.name = name
+        self.state = state
+        self.flags = flags
+        self.partitions = partitions
+        self.cpu_alloc = cpu_alloc
+        self.cpu_tot = cpu_tot
+        self.real_mem_mb = real_mem_mb
+        self.alloc_mem_mb = alloc_mem_mb
+        self.gpu_type = gpu_type
+        self.gpu_total = gpu_total
+        self.gpu_alloc = gpu_alloc
+
+    @classmethod
+    def parse(cls, line: str) -> "Node":
+        kv: dict[str, str] = {}
+        for tok in line.split():
+            if "=" in tok:
+                k, _, v = tok.partition("=")
+                kv[k] = v
+        # Compound state like MIXED+PLANNED → base + flags.
+        state_raw = kv.get("State", "")
+        if "+" in state_raw:
+            state, _, flags = state_raw.partition("+")
+        else:
+            state, flags = state_raw, ""
+        partitions = [p for p in kv.get("Partitions", "").split(",") if p]
+
+        gpu_type = ""
+        gpu_total = 0
+        gres = kv.get("Gres", "")
+        if gres and gres != "(null)":
+            for match in GRES_GPU_RE.finditer(gres):
+                # First gpu: line wins; multi-type per node is rare on Bouchet.
+                gpu_type = match.group(1)
+                gpu_total = int(match.group(2))
+                break
+
+        gpu_alloc = 0
+        alloc_tres = kv.get("AllocTRES", "")
+        if alloc_tres:
+            tm = ALLOC_GPU_TYPED_RE.search(alloc_tres)
+            if tm and (not gpu_type or tm.group(1) == gpu_type):
+                gpu_alloc = int(tm.group(2))
+                if not gpu_type:
+                    gpu_type = tm.group(1)
+            else:
+                tm2 = ALLOC_GPU_TOTAL_RE.search(alloc_tres)
+                if tm2:
+                    gpu_alloc = int(tm2.group(1))
+
+        return cls(
+            name=kv.get("NodeName", "?"),
+            state=state,
+            flags=flags,
+            partitions=partitions,
+            cpu_alloc=int(kv.get("CPUAlloc", "0") or 0),
+            cpu_tot=int(kv.get("CPUTot", "0") or 0),
+            real_mem_mb=int(kv.get("RealMemory", "0") or 0),
+            alloc_mem_mb=int(kv.get("AllocMem", "0") or 0),
+            gpu_type=gpu_type,
+            gpu_total=gpu_total,
+            gpu_alloc=gpu_alloc,
+        )
+
+
+def fmt_mb(mb: int) -> str:
+    if mb >= 1024 * 1024:
+        return f"{mb / 1024 / 1024:.1f}T"
+    if mb >= 1024:
+        return f"{mb / 1024:.0f}G"
+    return f"{mb}M"
+
+
+# ---------------------------------------------------------------------------
+# Sessions (local state)
+# ---------------------------------------------------------------------------
+
+class Sessions:
+    @staticmethod
+    def session_path(name: str) -> Path:
+        return STATE_DIR / f"session.{name}"
+
+    @staticmethod
+    def tunnel_path(name: str) -> Path:
+        return STATE_DIR / f"tunnel.{name}.spec"
+
+    @staticmethod
+    def list_names() -> list[str]:
+        if not STATE_DIR.exists():
+            return []
+        names: list[str] = []
+        for p in sorted(STATE_DIR.iterdir()):
+            if p.name.startswith("session.") and not p.name.endswith(".spec"):
+                names.append(p.name[len("session."):])
+        return names
+
+    @staticmethod
+    def load(name: str) -> dict:
+        p = Sessions.session_path(name)
+        if not p.exists() or not p.read_text().strip():
+            return {}
+        out: dict = {}
+        for line in p.read_text().splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                out[k.strip()] = v.strip()
+        return out
+
+    @staticmethod
+    def save(name: str, data: dict) -> None:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        body = "\n".join(f"{k}={v}" for k, v in data.items()) + "\n"
+        Sessions.session_path(name).write_text(body)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_name(name: str) -> str:
+    if not _NAME_RE.match(name):
+        die(f"invalid session name {name!r} (use only letters, digits, '.', '_', '-')")
+    return name
+
+
+def port_in_use(p: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", p))
+            return False
+        except OSError:
+            return True
+
+
+def pick_free_port(base: int, span: int = 50) -> int:
+    for p in range(base, base + span):
+        if not port_in_use(p):
+            return p
+    die(f"no free local port in [{base},{base + span - 1}]")
+
+
+def parse_forwards(s: str) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        l, _, r = tok.partition(":")
+        try:
+            out.append((int(l), int(r)))
+        except ValueError:
+            continue
+    return out
+
+
+def format_forwards(items: list[tuple[int, int]]) -> str:
+    return ",".join(f"{l}:{r}" for l, r in items)
+
+
+def parse_iso(s: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def fmt_eta(start: str) -> str:
+    dt = parse_iso(start)
+    if not dt:
+        return "-"
+    now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+    delta = (dt - now).total_seconds()
+    if delta < 0:
+        return "now"
+    h, rem = divmod(int(delta), 3600)
+    m = rem // 60
+    if h >= 24:
+        return f"in {h // 24}d {h % 24}h"
+    if h:
+        return f"in {h}h {m}m"
+    return f"in {m}m"
+
+
+def push_env_file(ssh: SSH, env_cmd: str, state_remote_dir: str) -> None:
+    if env_cmd:
+        body = (f"# generated by bouchet-jupyter — edit ~/.config/bouchet-jupyter/"
+                f"config.toml on your laptop\n{env_cmd}\n")
+        ssh.run(f"mkdir -p {state_remote_dir} && cat > {state_remote_dir}/env.sh",
+                input_data=body)
+    else:
+        ssh.run(f"rm -f {state_remote_dir}/env.sh", check=False)
+
+
+def build_sbatch_flags(profile: dict) -> list[str]:
+    flags: list[str] = []
+    for k, prefix in (("partition", "--partition="), ("gpus", "--gpus="),
+                      ("cpus", "--cpus-per-task="), ("mem", "--mem="),
+                      ("time", "--time=")):
+        v = profile.get(k)
+        if v not in (None, ""):
+            flags.append(f"{prefix}{v}")
+    return flags
+
+
+def resolve_name_for_read(arg_name: str | None) -> str:
+    if arg_name:
+        return arg_name
+    names = Sessions.list_names()
+    if not names:
+        die("no tracked sessions — run 'bouchet-jupyter up' first")
+    if len(names) == 1:
+        return names[0]
+    die("multiple sessions tracked — pass --name <NAME>:\n  " + "\n  ".join(names))
+
+
+def refresh_session_from_cluster(name: str, ssh: SSH, state_remote_dir: str) -> None:
+    """If local state lacks TOKEN, try to pull NODE/PORT/TOKEN from the cluster."""
+    cur = Sessions.load(name)
+    if not cur or "TOKEN" in cur:
+        return
+    out = ssh.run(f"cat {state_remote_dir}/session.{shlex.quote(name)} 2>/dev/null", check=False)
+    if "TOKEN=" not in out:
+        return
+    payload: dict = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            payload[k.strip()] = v.strip()
+    cur.update(payload)
+    Sessions.save(name, cur)
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_up(args, cfg: Config) -> None:
+    name    = _validate_name(args.name or "default")
+    profile = args.profile or cfg.default_profile
+    if Sessions.session_path(name).exists() or Sessions.tunnel_path(name).exists():
+        die(f"session '{name}' already tracked. Run 'bouchet-jupyter down --name {name}' first.")
+
+    resolved = cfg.resolve_profile(profile)
+    base_port = args.port or cfg.local_port
+    lport = pick_free_port(base_port)
+
+    ssh = SSH(cfg.host)
+    print("Syncing env to cluster...")
+    push_env_file(ssh, cfg.env_cmd, cfg.state_remote_dir)
+
+    flags = build_sbatch_flags(resolved)
+    print(f"Submitting job (profile={profile}, name={name})...")
+    slurm = Slurm(ssh)
+    job_id = slurm.submit(cfg.sbatch_dir, cfg.sbatch_file, flags, name, cfg.state_remote_dir)
+    Sessions.save(name, {"JOB_ID": job_id, "PROFILE": profile, "LOCAL_PORT": str(lport)})
+    print(f"  job {job_id}  flags: {' '.join(flags) or '<sbatch defaults>'}  local_port={lport}")
+
+    print("Waiting for jupyter to start (Ctrl-C to stop waiting)...")
+    delay = POLL_START
+    last_state = ""
+    remote_session = f"{cfg.state_remote_dir}/session.{name}"
+    try:
+        while True:
+            payload = ssh.run(f"cat {remote_session} 2>/dev/null", check=False)
+            if "TOKEN=" in payload:
+                merged = {"JOB_ID": job_id, "PROFILE": profile, "LOCAL_PORT": str(lport)}
+                for line in payload.splitlines():
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        merged[k.strip()] = v.strip()
+                Sessions.save(name, merged)
+                break
+            state = slurm.state(job_id)
+            if not state:
+                final = slurm.final_state(job_id)
+                Sessions.session_path(name).unlink(missing_ok=True)
+                die(f"  job {job_id} left the queue (sacct: {final or 'unknown'}) — aborting")
+            if state != last_state:
+                print(f"  {state}")
+                last_state = state
+            time.sleep(delay)
+            delay = min(int(delay * 2), POLL_MAX)
+    except KeyboardInterrupt:
+        print()
+        print(f"interrupted — job {job_id} still queued. "
+              f"Run \"bouchet-jupyter down --name {name}\" to scancel.")
+        raise SystemExit(130)
+
+    s = Sessions.load(name)
+    print(f"  node={s['NODE']} port={s['PORT']}")
+    spec = f"{lport}:{s['NODE']}:{s['PORT']}"
+    print(f"Opening tunnel localhost:{lport} -> {s['NODE']}:{s['PORT']} via {cfg.host}...")
+    ssh.forward(spec)
+    Sessions.tunnel_path(name).write_text(spec + "\n")
+
+    url = f"http://localhost:{lport}/lab?token={s['TOKEN']}"
+    print()
+    print(f"  {url}")
+    print()
+    for opener in ("open", "xdg-open"):
+        if subprocess.run(["which", opener], capture_output=True).returncode == 0:
+            subprocess.run([opener, url], capture_output=True)
+            break
+
+
+def _down_one(name: str, ssh: SSH, cfg: Config) -> None:
+    tspec = Sessions.tunnel_path(name)
+    if tspec.exists():
+        ssh.cancel_forward(tspec.read_text().strip())
+        tspec.unlink(missing_ok=True)
+    s = Sessions.load(name)
+    node = s.get("NODE")
+    if node:
+        for lport, rport in parse_forwards(s.get("FORWARDS", "")):
+            ssh.cancel_forward(f"{lport}:{node}:{rport}")
+    Sessions.session_path(name).unlink(missing_ok=True)
+    if s.get("JOB_ID"):
+        Slurm(ssh).cancel(s["JOB_ID"])
+        print(f"[{name}] scancelled {s['JOB_ID']}")
+    ssh.run(f"rm -f {cfg.state_remote_dir}/session.{shlex.quote(name)}", check=False)
+    print(f"[{name}] tunnel down")
+
+
+def cmd_down(args, cfg: Config) -> None:
+    ssh = SSH(cfg.host)
+    if args.all:
+        names = Sessions.list_names()
+        if not names:
+            print("(no tracked sessions)")
+            return
+        for n in names:
+            _down_one(n, ssh, cfg)
+        return
+    name = args.name or "default"
+    if not Sessions.session_path(name).exists() and not Sessions.tunnel_path(name).exists():
+        die(f"no session named '{name}'")
+    _down_one(name, ssh, cfg)
+
+
+def _list_rows(cfg: Config) -> None:
+    names = Sessions.list_names()
+    if not names:
+        print("(no tracked sessions)")
+        return
+    ssh = SSH(cfg.host)
+    live_raw = ssh.run('squeue --me --name=jupyter -h -o "%i|%T|%R|%M|%l|%N"', check=False)
+    live: dict[str, list[str]] = {}
+    for line in live_raw.splitlines():
+        parts = line.split("|")
+        if len(parts) >= 6:
+            live[parts[0]] = parts
+    print(f"{'NAME':<12} {'PROFILE':<7} {'JOB_ID':<10} {'STATE':<10} {'NODE':<14} "
+          f"{'LPORT':<6} {'RPORT':<6} ELAPSED/LIMIT")
+    for n in names:
+        refresh_session_from_cluster(n, ssh, cfg.state_remote_dir)
+        s = Sessions.load(n)
+        jid = s.get("JOB_ID", "?")
+        row = live.get(jid)
+        if row:
+            state = row[1]
+            elapsed, limit = row[3], row[4]
+            node = s.get("NODE") or row[5]
+        else:
+            state, elapsed, limit, node = "STALE", "-", "-", s.get("NODE", "-")
+        print(f"{n:<12} {s.get('PROFILE','?'):<7} {jid:<10} {state:<10} "
+              f"{node:<14} {s.get('LOCAL_PORT','?'):<6} {s.get('PORT','-'):<6} "
+              f"{elapsed}/{limit}")
+
+
+def cmd_list(args, cfg: Config) -> None:
+    _list_rows(cfg)
+
+
+def cmd_status(args, cfg: Config) -> None:
+    if not args.name:
+        _list_rows(cfg)
+        return
+    name = args.name
+    if not Sessions.session_path(name).exists():
+        die(f"no session named '{name}'")
+    ssh = SSH(cfg.host)
+    refresh_session_from_cluster(name, ssh, cfg.state_remote_dir)
+    s = Sessions.load(name)
+    for k in ("JOB_ID", "PROFILE", "LOCAL_PORT", "NODE", "PORT", "TOKEN"):
+        if k in s:
+            print(f"{k}={s[k]}")
+    if "JOB_ID" not in s:
+        return
+    print()
+    state = Slurm(ssh).state(s["JOB_ID"])
+    if not state:
+        print(f"STALE — job {s['JOB_ID']} is no longer active. "
+              f"Run 'bouchet-jupyter down --name {name}' to clean up.")
+    elif "TOKEN" in s:
+        print(f"job {s['JOB_ID']}: {state}  (jupyter ready)")
+    else:
+        print(f"job {s['JOB_ID']}: {state}  (jupyter not yet up)")
+
+
+def cmd_url(args, cfg: Config) -> None:
+    name = resolve_name_for_read(args.name)
+    ssh = SSH(cfg.host)
+    refresh_session_from_cluster(name, ssh, cfg.state_remote_dir)
+    s = Sessions.load(name)
+    if not s.get("TOKEN"):
+        die(f"session '{name}' has no TOKEN yet — jupyter still starting")
+    print(f"http://localhost:{s.get('LOCAL_PORT', cfg.local_port)}/lab?token={s['TOKEN']}")
+
+
+def cmd_logs(args, cfg: Config) -> None:
+    name = resolve_name_for_read(args.name)
+    s = Sessions.load(name)
+    if not s.get("JOB_ID"):
+        die(f"session '{name}' has no JOB_ID")
+    ssh = SSH(cfg.host)
+    # Stream — replace this process so Ctrl-C propagates cleanly.
+    os.execvp("ssh", ["ssh", cfg.host, f"tail -f {cfg.log_dir}/jupyter-{s['JOB_ID']}.out"])
+
+
+def cmd_config(args, cfg: Config) -> None:
+    if args.init:
+        if CONFIG_TOML.exists():
+            die(f"{CONFIG_TOML} already exists")
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_TOML.write_text(_starter_toml())
+        print(f"wrote {CONFIG_TOML}")
+        return
+    print(f"config file: {CONFIG_TOML}  (exists: {'yes' if CONFIG_TOML.exists() else 'no'})")
+    print()
+    for k in DEFAULTS:
+        v = getattr(cfg, k)
+        print(f"  {k:<18} = {v}")
+    print()
+    print("ad-hoc overrides:")
+    for k in ("partition", "gpus", "cpus", "mem", "time"):
+        print(f"  {k:<10} = {cfg.overrides.get(k, '<from profile>')}")
+    print()
+    print("profiles:")
+    for pname in sorted(cfg.profiles):
+        p = cfg.profiles[pname]
+        print(f"  {pname:<6} partition={p.get('partition',''):<10} "
+              f"gpus={p.get('gpus','') or '-':<8} "
+              f"cpus={p.get('cpus',''):<3} mem={p.get('mem',''):<5} "
+              f"time={p.get('time','')}")
+
+
+def _starter_toml() -> str:
+    return f"""# bouchet-jupyter config
+
+host = "{DEFAULTS['host']}"
+local_port = {DEFAULTS['local_port']}
+sbatch_dir = "{DEFAULTS['sbatch_dir']}"
+sbatch_file = "{DEFAULTS['sbatch_file']}"
+log_dir = "{DEFAULTS['log_dir']}"
+state_remote_dir = "{DEFAULTS['state_remote_dir']}"
+default_profile = "{DEFAULTS['default_profile']}"
+env_cmd = "module load JupyterLab/4.2.5-GCCcore-13.3.0"
+
+# Built-in profiles (gpu, cpu) are baked in. Override per-key with
+# [profiles.<name>] tables; add new profiles the same way.
+# [profiles.gpu]
+# time = "04:00:00"
+#
+# [profiles.b200]
+# partition = "gpu_b200"
+# gpus = "b200:1"
+# cpus = 8
+# mem = "64G"
+# time = "08:00:00"
+
+# [overrides]
+# partition = "..."
+# gpus = "..."
+"""
+
+
+def cmd_adopt(args, cfg: Config) -> None:
+    ssh = SSH(cfg.host)
+    raw = ssh.run(f"ls -1 {cfg.state_remote_dir}/session.* 2>/dev/null", check=False)
+    remote_files = [f for f in raw.splitlines() if f.strip()]
+    if not remote_files:
+        print("(no sessions on cluster)")
+        return
+    adopted = 0
+    for path in remote_files:
+        rname = Path(path).name[len("session."):]
+        if args.name and rname != args.name:
+            continue
+        body = ssh.run(f"cat {shlex.quote(path)} 2>/dev/null", check=False)
+        if "TOKEN=" not in body:
+            print(f"[{rname}] skipped (no TOKEN — job still pending)")
+            continue
+        payload: dict = {}
+        for line in body.splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                payload[k.strip()] = v.strip()
+        existing = Sessions.load(rname)
+        local_port = existing.get("LOCAL_PORT") or str(pick_free_port(cfg.local_port))
+        profile    = existing.get("PROFILE") or "?"
+        merged = {"JOB_ID": payload.get("JOB_ID", ""), "PROFILE": profile,
+                  "LOCAL_PORT": local_port,
+                  "NODE": payload.get("NODE", ""), "PORT": payload.get("PORT", ""),
+                  "TOKEN": payload.get("TOKEN", "")}
+        Sessions.save(rname, merged)
+        adopted += 1
+        # Reopen tunnel if missing.
+        tspec = Sessions.tunnel_path(rname)
+        if not tspec.exists():
+            spec = f"{local_port}:{merged['NODE']}:{merged['PORT']}"
+            try:
+                ssh.forward(spec)
+                tspec.write_text(spec + "\n")
+                print(f"[{rname}] adopted, tunnel localhost:{local_port} -> "
+                      f"{merged['NODE']}:{merged['PORT']}")
+            except SSHError as e:
+                print(f"[{rname}] adopted, but tunnel failed: {e}", file=sys.stderr)
+        else:
+            print(f"[{rname}] adopted (tunnel already up)")
+    if adopted == 0:
+        print("(nothing adopted)")
+
+
+# ---------------------------------------------------------------------------
+# Tunnel subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_tunnel_up(args, cfg: Config) -> None:
+    name = resolve_name_for_read(args.name)
+    if not Sessions.session_path(name).exists():
+        die(f"no session named '{name}'; try 'bouchet-jupyter adopt' first")
+    ssh = SSH(cfg.host)
+    refresh_session_from_cluster(name, ssh, cfg.state_remote_dir)
+    s = Sessions.load(name)
+    for k in ("JOB_ID", "NODE", "PORT", "LOCAL_PORT"):
+        if not s.get(k):
+            die(f"session '{name}' is missing {k} — try 'bouchet-jupyter adopt --name {name}'")
+    if not s.get("TOKEN"):
+        die(f"jupyter not yet up for '{name}' (no TOKEN); check 'bouchet-jupyter status --name {name}'")
+    if not Slurm(ssh).state(s["JOB_ID"]):
+        die(f"job {s['JOB_ID']} is no longer active; "
+            f"run 'bouchet-jupyter down --name {name}' to clean up")
+
+    if args.port is not None:
+        lport = args.port
+        if str(lport) != s.get("LOCAL_PORT"):
+            s["LOCAL_PORT"] = str(lport)
+            Sessions.save(name, s)
+    else:
+        lport = int(s["LOCAL_PORT"])
+
+    spec = f"{lport}:{s['NODE']}:{s['PORT']}"
+    tspec_path = Sessions.tunnel_path(name)
+    if tspec_path.exists():
+        old_spec = tspec_path.read_text().strip()
+        if old_spec and old_spec != spec:
+            ssh.cancel_forward(old_spec)
+
+    try:
+        ssh.forward(spec)
+    except SSHError as e:
+        msg = str(e)
+        if "in use" in msg or "Address already in use" in msg or "cannot listen" in msg.lower():
+            die(f"local port {lport} is in use by another process; "
+                f"pass --port NEW to pick a different one")
+        die(f"tunnel forward failed: {msg}")
+    tspec_path.write_text(spec + "\n")
+    print(f"Tunnel up: localhost:{lport} -> {s['NODE']}:{s['PORT']}")
+    print(f"http://localhost:{lport}/lab?token={s['TOKEN']}")
+
+
+# ---------------------------------------------------------------------------
+# Forward subcommands (extra port forwards on a session's node)
+# ---------------------------------------------------------------------------
+
+def _resolve_node_for_forward(name: str, args, cfg: Config, ssh: SSH) -> str:
+    if args.node:
+        return args.node
+    s = Sessions.load(name)
+    if not s.get("NODE"):
+        refresh_session_from_cluster(name, ssh, cfg.state_remote_dir)
+        s = Sessions.load(name)
+    node = s.get("NODE")
+    if not node:
+        die(f"session '{name}' has no NODE yet — pass --node, or wait for the job to start")
+    return node
+
+
+def cmd_forward_up(args, cfg: Config) -> None:
+    name = resolve_name_for_read(args.name)
+    if not Sessions.session_path(name).exists():
+        die(f"no session named '{name}'")
+    ssh = SSH(cfg.host)
+    node = _resolve_node_for_forward(name, args, cfg, ssh)
+    rport = args.remote if args.remote is not None else args.port
+    spec = f"{args.port}:{node}:{rport}"
+    try:
+        ssh.forward(spec)
+    except SSHError as e:
+        msg = str(e)
+        if "in use" in msg or "Address already in use" in msg or "cannot listen" in msg.lower():
+            die(f"local port {args.port} is in use by another process; "
+                f"pass a different port")
+        die(f"forward failed: {msg}")
+    s = Sessions.load(name)
+    forwards = [(l, r) for l, r in parse_forwards(s.get("FORWARDS", "")) if l != args.port]
+    forwards.append((args.port, rport))
+    s["FORWARDS"] = format_forwards(forwards)
+    Sessions.save(name, s)
+    print(f"Forward up: localhost:{args.port} -> {node}:{rport}  (session={name})")
+
+
+def cmd_forward_down(args, cfg: Config) -> None:
+    name = resolve_name_for_read(args.name)
+    if not Sessions.session_path(name).exists():
+        die(f"no session named '{name}'")
+    s = Sessions.load(name)
+    forwards = parse_forwards(s.get("FORWARDS", ""))
+    match = next(((l, r) for l, r in forwards if l == args.port), None)
+    if not match:
+        die(f"no tracked forward on port {args.port} for session '{name}'")
+    node = s.get("NODE")
+    if not node:
+        die(f"session '{name}' has no NODE; cannot derive forward spec")
+    lport, rport = match
+    SSH(cfg.host).cancel_forward(f"{lport}:{node}:{rport}")
+    remaining = [(l, r) for l, r in forwards if l != lport]
+    if remaining:
+        s["FORWARDS"] = format_forwards(remaining)
+    else:
+        s.pop("FORWARDS", None)
+    Sessions.save(name, s)
+    print(f"Forward down: localhost:{lport} -> {node}:{rport}")
+
+
+def cmd_forward_list(args, cfg: Config) -> None:
+    names = [args.name] if args.name else Sessions.list_names()
+    if not names:
+        print("(no tracked sessions)")
+        return
+    any_printed = False
+    for n in names:
+        s = Sessions.load(n)
+        forwards = parse_forwards(s.get("FORWARDS", ""))
+        if not forwards:
+            continue
+        any_printed = True
+        node = s.get("NODE", "?")
+        print(f"[{n}] node={node}")
+        for lport, rport in forwards:
+            print(f"  localhost:{lport} -> {node}:{rport}")
+    if not any_printed:
+        print("(no extra forwards)")
+
+
+# ---------------------------------------------------------------------------
+# Inspect subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_inspect_gpus(args, cfg: Config) -> None:
+    nodes = Slurm(SSH(cfg.host)).nodes()
+    by_type: dict[str, dict] = {}
+    for n in nodes:
+        if not n.gpu_type or n.gpu_total == 0:
+            continue
+        b = by_type.setdefault(n.gpu_type, {"used": 0, "total": 0, "free_nodes": 0,
+                                            "node_count": 0, "partitions": set()})
+        b["used"]  += n.gpu_alloc
+        b["total"] += n.gpu_total
+        b["node_count"] += 1
+        if n.gpu_alloc < n.gpu_total and n.state in ("IDLE", "MIXED"):
+            b["free_nodes"] += 1
+        for p in n.partitions:
+            b["partitions"].add(p)
+
+    if not by_type:
+        print("(no GPUs found)")
+        return
+    print(f"{'TYPE':<28} {'USED':>5} {'TOTAL':>6} {'FREE':>5} {'NODES_FREE':>11}  PARTITIONS")
+    for t in sorted(by_type, key=lambda k: -by_type[k]["total"]):
+        b = by_type[t]
+        free = b["total"] - b["used"]
+        parts = ", ".join(sorted(b["partitions"]))
+        print(f"{t:<28} {b['used']:>5} {b['total']:>6} {free:>5} "
+              f"{b['free_nodes']}/{b['node_count']:<8}  {parts}")
+
+
+def cmd_inspect_nodes(args, cfg: Config) -> None:
+    nodes = Slurm(SSH(cfg.host)).nodes()
+    by_part: dict[str, list[Node]] = {}
+    for n in nodes:
+        for p in n.partitions:
+            if args.partition and p != args.partition:
+                continue
+            by_part.setdefault(p, []).append(n)
+    if not by_part:
+        if args.partition:
+            die(f"no nodes in partition '{args.partition}'")
+        die("(no partitions found)")
+
+    for pname in sorted(by_part):
+        ns = by_part[pname]
+        cpu_alloc = sum(x.cpu_alloc for x in ns)
+        cpu_tot   = sum(x.cpu_tot for x in ns)
+        gpu_alloc = sum(x.gpu_alloc for x in ns)
+        gpu_tot   = sum(x.gpu_total for x in ns)
+        gpu_blurb = f", {gpu_alloc}/{gpu_tot} gpu used" if gpu_tot else ""
+        print(f"{pname}  ({len(ns)} nodes{gpu_blurb}, {cpu_alloc}/{cpu_tot} cpu used)")
+        for n in sorted(ns, key=lambda x: x.name):
+            gpu_col = f"gpu={n.gpu_alloc}/{n.gpu_total}" if n.gpu_total else "gpu=-"
+            mem_col = f"mem={fmt_mb(n.alloc_mem_mb)}/{fmt_mb(n.real_mem_mb)}"
+            flags   = n.flags or "-"
+            print(f"  {n.name:<14} state={n.state:<10} {gpu_col:<10} "
+                  f"cpu={n.cpu_alloc}/{n.cpu_tot:<4} {mem_col:<18} flags={flags}")
+        print()
+
+
+def cmd_inspect_wait(args, cfg: Config) -> None:
+    ssh = SSH(cfg.host)
+    slurm = Slurm(ssh)
+    targets: list[tuple[str, str]] = []   # (display_name, job_id)
+    if args.job:
+        sname = "-"
+        for n in Sessions.list_names():
+            s = Sessions.load(n)
+            if s.get("JOB_ID") == args.job:
+                sname = n
+                break
+        targets.append((sname, args.job))
+    else:
+        # Default: pending tracked sessions only (intersection).
+        my_pd = {row["job_id"]: row for row in slurm.my_pending()}
+        for n in Sessions.list_names():
+            s = Sessions.load(n)
+            jid = s.get("JOB_ID")
+            if jid and jid in my_pd:
+                targets.append((n, jid))
+        if not targets:
+            print("(no pending tracked sessions; pass --job ID to query an arbitrary job)")
+            return
+
+    # Single cluster-wide pending query → computes queue position locally.
+    pending_raw = ssh.run("squeue -h -t PD -o '%i|%Q|%P'", check=False)
+    by_part: dict[str, list[int]] = {}        # partition -> sorted desc priorities
+    me_lookup: dict[str, tuple[int, str]] = {} # job_id -> (priority, partition)
+    for line in pending_raw.splitlines():
+        parts = line.split("|")
+        if len(parts) < 3:
+            continue
+        jid_p, prio_s, part = parts[0], parts[1], parts[2]
+        try:
+            prio = int(prio_s)
+        except ValueError:
+            continue
+        by_part.setdefault(part, []).append(prio)
+        me_lookup[jid_p] = (prio, part)
+
+    print(f"{'NAME':<10} {'JOB_ID':<10} {'PARTITION':<12} {'PRIO':<6} "
+          f"{'POS':<8} {'REASON':<14} {'START_ESTIMATE':<22} ETA")
+    for sname, jid in targets:
+        est = slurm.start_estimate(jid)
+        if jid in me_lookup:
+            my_prio, my_part = me_lookup[jid]
+            ahead = sum(1 for p in by_part.get(my_part, []) if p > my_prio)
+            total = len(by_part.get(my_part, []))
+            pos = f"{ahead + 1}/{total}"
+        else:
+            pos = "-"
+        if not est:
+            print(f"{sname:<10} {jid:<10} {'?':<12} {'?':<6} "
+                  f"{pos:<8} {'?':<14} {'(no estimate)':<22} -")
+            continue
+        eta = fmt_eta(est["start"]) if est["start"] != "N/A" else "-"
+        print(f"{sname:<10} {jid:<10} {est['partition']:<12} {est['priority']:<6} "
+              f"{pos:<8} {est['reason']:<14} {est['start']:<22} {eta}")
+
+
+# ---------------------------------------------------------------------------
+# Main / argparse
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="bouchet-jupyter",
+        description="Launch / tear down JupyterLab sessions on Bouchet, and "
+                    "inspect cluster state.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")
+
+    sp = sub.add_parser("up", help="submit a job, wait for it, open tunnel + browser",
+                        description="Submit a Jupyter job, wait until it lands, "
+                                    "open an SSH tunnel and the browser URL.")
+    sp.add_argument("--profile", help=f"profile name (default: from config, e.g. gpu/cpu)")
+    sp.add_argument("--name", help="session name (default: 'default')")
+    sp.add_argument("--port", type=int, help="local port base (auto-bumped if busy)")
+    sp.set_defaults(fn=cmd_up)
+
+    sp = sub.add_parser("down", help="tear down a session (or all)",
+                        description="Cancel the Slurm job and close its tunnel.")
+    sp.add_argument("--name", help="session name (default: 'default')")
+    sp.add_argument("--all", action="store_true", help="tear down every tracked session")
+    sp.set_defaults(fn=cmd_down)
+
+    sp = sub.add_parser("list", help="list tracked sessions",
+                        description="One row per session with live Slurm state.")
+    sp.set_defaults(fn=cmd_list)
+
+    sp = sub.add_parser("status", help="show one session, or list all if no name",
+                        description="With --name: full session payload + live job state. "
+                                    "Without: same output as `list`.")
+    sp.add_argument("--name")
+    sp.set_defaults(fn=cmd_status)
+
+    sp = sub.add_parser("url", help="print the browser URL for a session",
+                        description="Prints http://localhost:LPORT/lab?token=... .")
+    sp.add_argument("--name")
+    sp.set_defaults(fn=cmd_url)
+
+    sp = sub.add_parser("logs", help="tail the job's stdout/stderr log",
+                        description="Streams the cluster-side log file.")
+    sp.add_argument("--name")
+    sp.set_defaults(fn=cmd_logs)
+
+    sp = sub.add_parser("adopt", help="discover sessions on the cluster, write local state",
+                        description="Useful after losing local state, or when starting "
+                                    "from a second laptop.")
+    sp.add_argument("--name", help="adopt only this session")
+    sp.set_defaults(fn=cmd_adopt)
+
+    sp = sub.add_parser("tunnel", help="manage the local SSH tunnel for a session",
+                        description="Re-open a session's SSH tunnel without resubmitting "
+                                    "the Slurm job. Useful after laptop sleep or network drops.")
+    tsub = sp.add_subparsers(dest="tunnel_cmd", required=True, metavar="<action>")
+
+    tsp = tsub.add_parser("up", help="(re)open the SSH tunnel for a session",
+                          description="Verifies the Slurm job is still active, then "
+                                      "(re)establishes the local port forward.")
+    tsp.add_argument("--name", help="session name (default: 'default' or sole session)")
+    tsp.add_argument("--port", type=int, help="override LOCAL_PORT (also updates saved state)")
+    tsp.set_defaults(fn=cmd_tunnel_up)
+
+    sp = sub.add_parser("forward", help="open / close extra port forwards on a session's node",
+                        description="Forward additional ports through the existing ControlMaster, "
+                                    "targeting the compute node where a session's job runs. "
+                                    "Forwards are tracked in session state and torn down on `down`.")
+    fsub = sp.add_subparsers(dest="forward_cmd", required=True, metavar="<action>")
+
+    fsp = fsub.add_parser("up", help="open a port forward to the session's node",
+                          description="localhost:PORT -> NODE:REMOTE (default REMOTE=PORT).")
+    fsp.add_argument("port", type=int, help="local port to listen on")
+    fsp.add_argument("--remote", type=int, help="remote port on the node (default: same as local)")
+    fsp.add_argument("--node", help="override target node (default: session's NODE)")
+    fsp.add_argument("--name", help="session name (default: sole tracked session)")
+    fsp.set_defaults(fn=cmd_forward_up)
+
+    fsp = fsub.add_parser("down", help="close a tracked forward",
+                          description="Cancels the forward and drops it from session state.")
+    fsp.add_argument("port", type=int, help="local port of the forward to close")
+    fsp.add_argument("--name", help="session name (default: sole tracked session)")
+    fsp.set_defaults(fn=cmd_forward_down)
+
+    fsp = fsub.add_parser("list", help="list extra forwards on tracked sessions",
+                          description="Tracked extra forwards (excluding the jupyter tunnel).")
+    fsp.add_argument("--name", help="limit to one session")
+    fsp.set_defaults(fn=cmd_forward_list)
+
+    sp = sub.add_parser("config", help="show resolved config",
+                        description="Prints the resolved values; --init writes a starter TOML.")
+    sp.add_argument("--init", action="store_true", help="write a starter config.toml")
+    sp.set_defaults(fn=cmd_config)
+
+    sp = sub.add_parser("inspect", help="cluster-state queries (gpus / nodes / wait)",
+                        description="Read-only queries against Slurm.")
+    isub = sp.add_subparsers(dest="inspect_cmd", required=True, metavar="<query>")
+
+    isp = isub.add_parser("gpus", help="GPU usage by type",
+                          description="Aggregates `scontrol show node` by GPU type.")
+    isp.set_defaults(fn=cmd_inspect_gpus)
+
+    isp = isub.add_parser("nodes", help="per-node usage grouped by partition",
+                          description="Each node listed under every partition it belongs to.")
+    isp.add_argument("--partition", help="narrow to one partition")
+    isp.set_defaults(fn=cmd_inspect_nodes)
+
+    isp = isub.add_parser("wait", help="start-time estimate for pending tracked sessions",
+                          description="Default: pending tracked sessions only. "
+                                      "Use --job to query an arbitrary job ID.")
+    isp.add_argument("--job", help="query a specific JOB_ID instead of tracked sessions")
+    isp.set_defaults(fn=cmd_inspect_wait)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    cfg = Config.load()
+    try:
+        args.fn(args, cfg)
+    except SSHError as e:
+        die(f"ssh: {e}")
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        die(f"error: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

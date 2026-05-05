@@ -1,0 +1,32 @@
+host = "bouchet"
+local_port = 8888
+
+# Where on the cluster jupyter_launch.sh lives.
+sbatch_dir = "$HOME/SlurmScripts"
+sbatch_file = "jupyter_launch.sh"
+log_dir = "$HOME/SlurmScripts/job_logs"
+
+# Per-session state (token, node, port) gets written here on the cluster.
+state_remote_dir = "$HOME/.jupyter-cluster"
+
+# Run before launching jupyter. Replace with whatever puts `jupyter` on PATH.
+env_cmd = "module load JupyterLab/4.2.5-GCCcore-13.3.0"
+
+default_profile = "gpu"
+
+# Built-in profiles (gpu, cpu) work out of the box. Override or add more:
+#
+# [profiles.gpu]
+# time = "04:00:00"
+#
+# [profiles.b200]
+# partition = "gpu_b200"
+# gpus = "b200:1"
+# cpus = 8
+# mem = "64G"
+# time = "08:00:00"
+
+# One-shot overrides applied on top of the chosen profile:
+#
+# [overrides]
+# time = "12:00:00"

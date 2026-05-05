@@ -1,0 +1,101 @@
+# bouchet-jupyter
+
+Run JupyterLab on Yale's Bouchet cluster from a laptop. Submits a Slurm
+job, waits for it, opens an SSH tunnel, prints the browser URL. Also
+forwards extra ports — handy when you want to talk to a viser viewer or
+similar that's running inside the same job.
+
+## Layout
+
+- `bouchet-jupyter` — the laptop-side CLI (Python, no dependencies on 3.11+)
+- `jupyter_launch.sh` — the sbatch script that runs on the cluster
+- `config.example.toml` — copy to `~/.config/bouchet-jupyter/config.toml`
+
+## Install
+
+### Laptop
+
+```
+ln -s "$PWD/bouchet-jupyter" ~/bin/bouchet-jupyter
+mkdir -p ~/.config/bouchet-jupyter
+cp config.example.toml ~/.config/bouchet-jupyter/config.toml
+```
+
+Make sure `~/bin` is on `PATH`. Python 3.11+ uses stdlib `tomllib`; on
+3.10 or older, `pip install --user tomli`.
+
+Edit the config — at minimum `sbatch_dir`, `log_dir`, and `env_cmd`.
+
+SSH config needs ControlMaster so `ssh -O forward` can manage tunnels
+through a shared connection:
+
+```
+Host bouchet
+    HostName bouchet.ycrc.yale.edu
+    User <netid>
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 8h
+```
+
+### Cluster
+
+Drop the sbatch script wherever your config's `sbatch_dir` points:
+
+```
+ssh bouchet 'mkdir -p ~/SlurmScripts'
+scp jupyter_launch.sh bouchet:~/SlurmScripts/
+```
+
+Edit the `#SBATCH --account=...` line in the script to match your
+allocation. Resource flags (partition, gpus, cpus, mem, time) come from
+the laptop's chosen profile, so you don't set them in the script.
+
+## Use
+
+```
+bouchet-jupyter up                       # submit, wait, tunnel, open browser
+bouchet-jupyter up --profile cpu
+bouchet-jupyter up --name foo            # second concurrent session
+
+bouchet-jupyter list                     # tracked sessions, live state
+bouchet-jupyter status --name foo
+bouchet-jupyter url                      # print http://localhost:.../lab?token=...
+bouchet-jupyter logs                     # tail the slurm log
+
+bouchet-jupyter down                     # scancel + close tunnels
+bouchet-jupyter down --all
+```
+
+After a laptop reboot or network drop:
+
+```
+bouchet-jupyter adopt                    # rediscover sessions on the cluster
+bouchet-jupyter tunnel up                # reopen the jupyter tunnel
+```
+
+Extra port forwards on the same compute node (e.g. for a viewer running
+inside the job):
+
+```
+bouchet-jupyter forward up 8082          # localhost:8082 -> NODE:8082
+bouchet-jupyter forward up 8082 --remote 9000
+bouchet-jupyter forward list
+bouchet-jupyter forward down 8082
+```
+
+These are tracked in session state and torn down by `down`.
+
+Cluster snapshots:
+
+```
+bouchet-jupyter inspect gpus             # GPU usage by type
+bouchet-jupyter inspect nodes --partition gpu_h200
+bouchet-jupyter inspect wait             # start-time estimate for pending jobs
+```
+
+## Files
+
+- `~/.config/bouchet-jupyter/config.toml` — paths, profiles, env_cmd
+- `~/.local/state/bouchet-jupyter/` — local session and tunnel state
+- `~/.jupyter-cluster/` on bouchet — remote session payloads, `env.sh`

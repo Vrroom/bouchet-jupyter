@@ -79,6 +79,24 @@ bouchet-jupyter inspect nodes --partition gpu_h200
 bouchet-jupyter inspect wait             # start-time estimate for pending jobs
 ```
 
+## Freshness
+
+Every session-touching command (`up`, `down`, `list`, `status`, `url`,
+`logs`, `tunnel up`, `forward up/down`, `adopt`) re-pulls the cluster's
+view of the session before acting, with a 5-second freshness window —
+repeated commands within that window reuse the previous sync. `up` and
+`tunnel up` always force-refresh.
+
+When the cluster confirms a session's job has ended (squeue absent +
+sacct terminal), the local session file and any open tunnel are cleaned
+up automatically and a `[<name>] cleaned stale (job <ID> ended)` note is
+printed to stderr. If sacct is silent (lagging or disabled), the local
+state is kept as `stale_unverified` — never deleted without proof of
+death.
+
+Pass `--no-sync` to `list` or `status` to read cached state without
+touching the cluster. Not available on `url` — by design.
+
 ## Files
 
 - `~/.config/bouchet-jupyter/config.toml` — paths, profiles, env_cmd

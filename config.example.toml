@@ -1,15 +1,32 @@
+# bouchet-jupyter config — copy to ~/.config/bouchet-jupyter/config.toml
+#
+# Fields a new user almost always needs to change are marked CHANGE.
+# The rest are sensible defaults.
+
+# CHANGE: SSH alias for the cluster (must be defined in ~/.ssh/config with
+# ControlMaster auto / ControlPath / ControlPersist — see README).
 host = "bouchet"
+
+# Local TCP port the laptop tunnel binds to. Pick anything free.
 local_port = 8888
 
-# Where on the cluster jupyter_launch.sh lives.
+# CHANGE: directory on the cluster where you've placed jupyter_launch.sh.
+# Yale users with a PI project space often want something like
+#   "$HOME/project_pi_<groupname>/<netid>/SlurmScripts"
+# rather than a homedir path, since project space has more quota.
 sbatch_dir = "$HOME/SlurmScripts"
 sbatch_file = "jupyter_launch.sh"
+
+# Where slurm writes stdout/stderr. Usually a subdir of sbatch_dir.
 log_dir = "$HOME/SlurmScripts/job_logs"
 
-# Per-session state (token, node, port) gets written here on the cluster.
+# Per-session state (token, node, port) gets written here on the cluster
+# by jupyter_launch.sh. Created automatically; rarely needs changing.
 state_remote_dir = "$HOME/.jupyter-cluster"
 
-# Run before launching jupyter. Replace with whatever puts `jupyter` on PATH.
+# CHANGE: command the cluster runs to put `jupyter` on PATH before launching.
+# On Bouchet a recent JupyterLab module works. On other clusters this might
+# be `source ~/miniconda3/bin/activate myenv` or similar.
 env_cmd = "module load JupyterLab/4.2.5-GCCcore-13.3.0"
 
 default_profile = "gpu"

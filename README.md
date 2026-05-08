@@ -13,6 +13,8 @@ similar that's running inside the same job.
 
 ## Install
 
+### Laptop side
+
 ```
 ln -s "$PWD/bouchet-jupyter" ~/bin/bouchet-jupyter
 mkdir -p ~/.config/bouchet-jupyter
@@ -22,7 +24,13 @@ cp config.example.toml ~/.config/bouchet-jupyter/config.toml
 Make sure `~/bin` is on `PATH`. Python 3.11+ uses stdlib `tomllib`; on
 3.10 or older, `pip install --user tomli`.
 
-Edit the config — at minimum `sbatch_dir`, `log_dir`, and `env_cmd`.
+Edit `~/.config/bouchet-jupyter/config.toml`. Fields marked `CHANGE` in
+the example are the ones a new user almost always needs to set:
+
+- `host` — your SSH alias (see SSH config below)
+- `sbatch_dir` — where `jupyter_launch.sh` will live on the cluster
+- `env_cmd` — how `jupyter` gets on PATH on the cluster (a `module load`
+  or `source ... activate <env>` line)
 
 SSH config needs ControlMaster so `ssh -O forward` can manage tunnels
 through a shared connection:
@@ -35,6 +43,26 @@ Host bouchet
     ControlPath ~/.ssh/cm-%r@%h:%p
     ControlPersist 8h
 ```
+
+### Cluster side
+
+Copy the launcher to the directory referenced by `sbatch_dir` in your
+config, and create the log directory:
+
+```
+ssh bouchet 'mkdir -p $HOME/SlurmScripts/job_logs'
+scp jupyter_launch.sh bouchet:SlurmScripts/
+```
+
+(If `sbatch_dir` points elsewhere — e.g. a project space like
+`$HOME/project_pi_<group>/<netid>/SlurmScripts` — substitute that path
+in both commands.)
+
+Then edit the `#SBATCH --account=...` line at the top of
+`jupyter_launch.sh` on the cluster to match your slurm account. On Yale
+Bouchet that's typically `pi_<groupname>`; check `sacctmgr show user $USER`
+if you're unsure. Same for `--qos` if your group uses something other
+than `normal`.
 
 ## Use
 

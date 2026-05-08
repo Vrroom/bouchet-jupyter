@@ -475,11 +475,32 @@ def port_in_use(p: int) -> bool:
             return True
 
 
-def pick_free_port(base: int, span: int = 50) -> int:
+def pick_free_port(base: int, span: int = 50, *,
+                   reserved: set[int] = frozenset()) -> int:
     for p in range(base, base + span):
+        if p in reserved:
+            continue
         if not port_in_use(p):
             return p
     die(f"no free local port in [{base},{base + span - 1}]")
+
+
+def reserved_local_ports(exclude_name: str | None = None) -> set[int]:
+    """LOCAL_PORTs already assigned to other tracked sessions.
+
+    Cache-only — does not ssh. We treat any tracked session's port as taken
+    even if its tunnel happens to be down right now, because that session
+    will try to re-open on the same port (e.g. via `tunnel up` or `adopt`).
+    """
+    out: set[int] = set()
+    for n in Sessions.list_names():
+        if n == exclude_name:
+            continue
+        try:
+            out.add(int(Sessions.load(n).get("LOCAL_PORT", "")))
+        except (ValueError, TypeError):
+            pass
+    return out
 
 
 def parse_forwards(s: str) -> list[tuple[int, int]]:
@@ -924,7 +945,7 @@ def cmd_up(args, cfg: Config) -> None:
 
     resolved  = cfg.resolve_profile(profile)
     base_port = args.port or cfg.local_port
-    lport     = pick_free_port(base_port)
+    lport     = pick_free_port(base_port, reserved=reserved_local_ports(exclude_name=name))
 
     print("Syncing env to cluster...")
     push_env_file(ssh, cfg.env_cmd, cfg.state_remote_dir)
@@ -946,7 +967,10 @@ def cmd_up(args, cfg: Config) -> None:
             if view.status == "live":
                 break
             if view.status in ("stale", "winding_down"):
-                autoclean_session(name, view.payload, ssh, [])
+                notes: list[str] = []
+                autoclean_session(name, view.payload, ssh, notes)
+                for note in notes:
+                    print(note, file=sys.stderr)
                 die(f"  job {job_id} left the queue ({view.status}) — aborting")
             if view.status == "unknown":
                 pass  # transient ssh failure; keep polling
@@ -1022,6 +1046,16 @@ def print_list_rows(views: dict[str, SessionView]) -> None:
     if not rows:
         print("(no tracked sessions)")
         return
+    lport_owners: dict[str, list[str]] = {}
+    for v in rows:
+        lp = v.payload.get("LOCAL_PORT")
+        if lp:
+            lport_owners.setdefault(lp, []).append(v.name)
+    for lp, names in lport_owners.items():
+        if len(names) > 1:
+            print(f"warning: LOCAL_PORT {lp} is shared by {', '.join(names)} — "
+                  f"only one tunnel can bind it; run 'tunnel up --name <other> --port <free>'",
+                  file=sys.stderr)
     print(f"{'NAME':<12} {'PROFILE':<7} {'JOB_ID':<10} {'STATE':<14} {'NODE':<14} "
           f"{'LPORT':<6} {'RPORT':<6} ELAPSED/LIMIT")
     for v in sorted(rows, key=lambda x: x.name):
@@ -1071,7 +1105,8 @@ def cmd_status(args, cfg: Config) -> None:
     if view.status == "missing":
         die(f"no session named '{name}'")
     s = view.payload
-    for k in ("JOB_ID", "PROFILE", "LOCAL_PORT", "NODE", "PORT", "TOKEN", "SUBMITTED_AT", "SYNCED_AT"):
+    for k in ("JOB_ID", "PROFILE", "LOCAL_PORT", "NODE", "PORT", "TOKEN",
+              "FORWARDS", "SUBMITTED_AT", "SYNCED_AT"):
         if k in s:
             print(f"{k}={s[k]}")
     print()
@@ -1093,7 +1128,16 @@ def cmd_url(args, cfg: Config) -> None:
     if not view.payload.get("TOKEN"):
         die(status_message(view) or f"session '{name}' has no TOKEN yet")
     s = view.payload
-    print(f"http://localhost:{s.get('LOCAL_PORT', cfg.local_port)}/lab?token={s['TOKEN']}")
+    lport = s.get("LOCAL_PORT")
+    if not lport:
+        die(f"session '{name}' has no LOCAL_PORT recorded; "
+            f"run 'bouchet-jupyter tunnel up --name {name}' first")
+    spec = read_tunnel_spec(name)
+    if not spec or spec.split(":", 1)[0] != lport:
+        die(f"session '{name}': no live tunnel on port {lport} "
+            f"(tunnel.spec {'missing' if not spec else 'has '+spec}); "
+            f"run 'bouchet-jupyter tunnel up --name {name}'")
+    print(f"http://localhost:{lport}/lab?token={s['TOKEN']}")
 
 
 def cmd_logs(args, cfg: Config) -> None:
@@ -1180,12 +1224,20 @@ def cmd_adopt(args, cfg: Config) -> None:
         print("(nothing to adopt)")
         return
     adopted = 0
+    used_ports = reserved_local_ports()
     for v in targets:
         s = v.payload
         if not s.get("LOCAL_PORT"):
-            s["LOCAL_PORT"] = str(pick_free_port(cfg.local_port))
+            lport = pick_free_port(cfg.local_port, reserved=used_ports)
+            s["LOCAL_PORT"] = str(lport)
+            used_ports.add(lport)
             Sessions.save(v.name, s)
             s = Sessions.load(v.name)
+        else:
+            try:
+                used_ports.add(int(s["LOCAL_PORT"]))
+            except (ValueError, TypeError):
+                pass
         if not s.get("TOKEN") or not s.get("NODE") or not s.get("PORT"):
             print(f"[{v.name}] skipped (job still launching, no TOKEN yet)")
             continue
@@ -1217,25 +1269,31 @@ def cmd_tunnel_up(args, cfg: Config) -> None:
     require_live(view)
     s = view.payload
     if not s.get("LOCAL_PORT"):
-        s["LOCAL_PORT"] = str(pick_free_port(cfg.local_port))
+        s["LOCAL_PORT"] = str(pick_free_port(
+            cfg.local_port, reserved=reserved_local_ports(exclude_name=name)))
         Sessions.save(name, s)
         s = Sessions.load(name)
 
     if args.port is not None:
         lport = args.port
-        if str(lport) != s.get("LOCAL_PORT"):
-            s["LOCAL_PORT"] = str(lport)
-            Sessions.save(name, s)
+        if lport in reserved_local_ports(exclude_name=name):
+            die(f"port {lport} is already assigned to another tracked session; "
+                f"pass a different --port or 'down' the other one first")
     else:
         lport = int(s["LOCAL_PORT"])
 
     spec = f"{lport}:{s['NODE']}:{s['PORT']}"
     old_spec = read_tunnel_spec(name)
-    if old_spec and old_spec != spec:
+    if old_spec:
+        # Always cancel the previous forward (cancel_forward is idempotent), so
+        # `tunnel up` can re-open a tunnel that ssh's mux still thinks exists.
         ssh.cancel_forward(old_spec)
 
     forward_or_die(ssh, spec, lport, "pass --port NEW to pick a different one")
     atomic_write_text(Sessions.tunnel_path(name), spec + "\n")
+    if str(lport) != s.get("LOCAL_PORT"):
+        s["LOCAL_PORT"] = str(lport)
+        Sessions.save(name, s)
     print(f"Tunnel up: localhost:{lport} -> {s['NODE']}:{s['PORT']}")
     print(f"http://localhost:{lport}/lab?token={s['TOKEN']}")
 
@@ -1274,6 +1332,8 @@ def cmd_forward_down(args, cfg: Config) -> None:
     if view.status == "missing":
         die(f"no session named '{name}'")
     s = view.payload or Sessions.load(name)
+    if not s:
+        die(f"session '{name}' has no local state; nothing to tear down")
     forwards = parse_forwards(s.get("FORWARDS", ""))
     match = next(((l, r) for l, r in forwards if l == args.port), None)
     if not match:
@@ -1282,7 +1342,10 @@ def cmd_forward_down(args, cfg: Config) -> None:
     if not node:
         die(f"session '{name}' has no NODE; cannot derive forward spec")
     lport, rport = match
-    ssh.cancel_forward(f"{lport}:{node}:{rport}")
+    try:
+        ssh.cancel_forward(f"{lport}:{node}:{rport}")
+    except Exception:
+        pass  # best-effort, matches close_session_forwards
     remaining = [(l, r) for l, r in forwards if l != lport]
     if remaining:
         s["FORWARDS"] = format_forwards(remaining)

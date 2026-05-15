@@ -46,7 +46,13 @@ JOB_ID=$SLURM_JOB_ID
 EOF
 mv "$TMP" "$SESSION_FILE"
 
-trap 'rm -f "$SESSION_FILE"' EXIT
+# Cleanup must run on normal exit AND on the signals Slurm uses to end a job
+# (TERM on scancel / time limit; HUP on node drain). SIGKILL still bypasses
+# this — that case is handled by the laptop clearing this file before submit.
+# Also: do NOT `exec jupyter` below — exec replaces this shell, removing the
+# trap entirely, which is why prior runs orphaned the session file on every
+# normal completion.
+trap 'rm -f "$SESSION_FILE"' EXIT INT TERM HUP QUIT
 
 echo "------------------------------------------------"
 echo "Jupyter job ${SLURM_JOB_ID} on $(hostname)"
@@ -55,7 +61,7 @@ echo "Start: $(date)"
 echo "------------------------------------------------"
 
 cd "$HOME"
-exec jupyter lab \
+jupyter lab \
     --no-browser \
     --ip=0.0.0.0 \
     --port="$PORT" \

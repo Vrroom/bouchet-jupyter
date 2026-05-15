@@ -273,12 +273,18 @@ class Slurm:
                session_name: str, state_remote_dir: str) -> str:
         """Submit and return JOB_ID, with double-capture for race resilience.
 
+        Also clears any preexisting session.$name file before sbatch runs — if a
+        previous job died without its cleanup trap firing (SIGKILL / node failure),
+        the leftover file would otherwise be readable by polling before the new
+        launcher's atomic write, and the laptop would tunnel to the wrong node.
+
         Paths (state_remote_dir / sbatch_dir) carry literal `$HOME` from config —
         keep them unquoted so the remote shell expands them. session_name is
         validated upstream (see validate_name)."""
-        marker = f"{state_remote_dir}/last-submit.{session_name}.id"
+        marker       = f"{state_remote_dir}/last-submit.{session_name}.id"
+        session_file = f"{state_remote_dir}/session.{shlex.quote(session_name)}"
         flags  = " ".join(shlex.quote(f) for f in sbatch_flags)
-        cmd = (f"mkdir -p {state_remote_dir} && rm -f {marker} && "
+        cmd = (f"mkdir -p {state_remote_dir} && rm -f {marker} {session_file} && "
                f"cd {sbatch_dir} && "
                f"sbatch --parsable --export=ALL,JC_SESSION={shlex.quote(session_name)} "
                f"{flags} {shlex.quote(sbatch_file)} | tee {marker}")
@@ -690,6 +696,7 @@ def require_live(view: SessionView, *, fallback: str | None = None) -> None:
 
 
 def classify_status(local: dict, remote_present: bool, remote_has_token: bool,
+              remote_job_match: bool,
               squeue_state: str | None, squeue_ok: bool,
               sacct_state: str | None) -> SessionStatus:
     if not squeue_ok:
@@ -697,7 +704,9 @@ def classify_status(local: dict, remote_present: bool, remote_has_token: bool,
     if squeue_state in WIND_DOWN_STATES:
         return "winding_down"
     if squeue_state:
-        return "live" if remote_has_token else "launching"
+        # "live" requires the cluster file to describe THIS job. Otherwise the
+        # new job's launcher hasn't yet rewritten it — keep waiting.
+        return "live" if (remote_has_token and remote_job_match) else "launching"
     # squeue reports no such job (or no JOB_ID was tracked yet).
     if not local and not remote_present:
         return "missing"
@@ -709,8 +718,29 @@ def classify_status(local: dict, remote_present: bool, remote_has_token: bool,
     return "stale_unverified"
 
 
+def remote_job_matches(local: dict, remote: dict) -> bool:
+    """True iff the remote session payload describes the same job we're tracking.
+
+    When `local` has not yet pinned a JOB_ID (e.g. `adopt` discovering a session
+    that only exists on the cluster), we trust whatever remote says. Once we've
+    submitted a job, we require remote.JOB_ID to match before treating its
+    NODE/PORT/TOKEN as ours — otherwise the file is a leftover from a previous
+    job whose cleanup didn't fire (SIGKILL / node failure / bypassed trap)."""
+    l = local.get("JOB_ID", "").strip()
+    if not l:
+        return True
+    r = remote.get("JOB_ID", "").strip()
+    return bool(r) and l == r
+
+
 def merge_remote(local: dict, remote: dict) -> dict:
-    """Cluster owns NODE/PORT/TOKEN/JOB_ID; local owns everything else."""
+    """Cluster owns NODE/PORT/TOKEN/JOB_ID for the current job; local owns the rest.
+
+    Refuses to merge when remote describes a different JOB_ID — that file is from
+    a previous job and merging it would poison local state with the wrong
+    NODE/PORT/TOKEN, causing a tunnel to the wrong host."""
+    if not remote_job_matches(local, remote):
+        return dict(local)
     payload = dict(local)
     for k in ("NODE", "PORT", "TOKEN", "JOB_ID"):
         if remote.get(k):
@@ -768,6 +798,7 @@ def sync_one(name: str, ssh: SSH, slurm: Slurm, cfg: Config,
         )
     squeue_ok, remote, sq_state, extras, sacct_state = ssh_one_session(ssh, slurm, cfg, name)
     status = classify_status(local, bool(remote), bool(remote.get("TOKEN")),
+                       remote_job_matches(local, remote),
                        sq_state, squeue_ok, sacct_state)
     payload = merge_remote(local, remote)
     notes: list[str] = []
@@ -843,7 +874,11 @@ def sync_all(ssh: SSH, slurm: Slurm, cfg: Config,
     for n in sorted(names):
         local = Sessions.load(n)
         remote = remote_by_name.get(n, {})
-        job_id = (remote.get("JOB_ID") or local.get("JOB_ID") or "").strip()
+        # Local JOB_ID is authoritative — it's what we submitted. Fall back to
+        # remote only when local hasn't pinned one yet (adopt of a cluster-only
+        # session). Reading remote first would let a stale leftover file pick
+        # the wrong job for squeue / sacct lookup.
+        job_id = (local.get("JOB_ID") or remote.get("JOB_ID") or "").strip()
         sq_state = live_jobs.get(job_id) if job_id else None
         sacct_state: str | None = None
         if squeue_ok and job_id and not sq_state:
@@ -852,6 +887,7 @@ def sync_all(ssh: SSH, slurm: Slurm, cfg: Config,
             except SSHError:
                 sacct_state = None
         status = classify_status(local, bool(remote), bool(remote.get("TOKEN")),
+                           remote_job_matches(local, remote),
                            sq_state, squeue_ok, sacct_state)
         payload = merge_remote(local, remote)
         notes: list[str] = []

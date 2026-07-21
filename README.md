@@ -70,6 +70,7 @@ than `normal`.
 bouchet-jupyter up                       # submit, wait, tunnel, open browser
 bouchet-jupyter up --profile cpu
 bouchet-jupyter up --name foo            # second concurrent session
+bouchet-jupyter up --hours 10            # 10h walltime (overrides profile time)
 
 bouchet-jupyter list                     # tracked sessions, live state
 bouchet-jupyter status --name foo
@@ -93,8 +94,10 @@ inside the job):
 ```
 bouchet-jupyter forward up 8082          # localhost:8082 -> NODE:8082
 bouchet-jupyter forward up 8082 --remote 9000
+bouchet-jupyter forward up 8082 8083 6006:16006   # several at once (LOCAL:REMOTE pairs ok)
 bouchet-jupyter forward list
 bouchet-jupyter forward down 8082
+bouchet-jupyter forward down 8082 8083
 ```
 
 These are tracked in session state and torn down by `down`.

@@ -527,6 +527,26 @@ def format_forwards(items: list[tuple[int, int]]) -> str:
     return ",".join(f"{l}:{r}" for l, r in items)
 
 
+def parse_port_spec(tok: str) -> tuple[int, int]:
+    """Parse a forward spec 'PORT' or 'LOCAL:REMOTE' into (lport, rport)."""
+    l, _, r = tok.partition(":")
+    try:
+        lport = int(l)
+        rport = int(r) if r else lport
+    except ValueError:
+        die(f"invalid port spec {tok!r} (use PORT or LOCAL:REMOTE)")
+    return lport, rport
+
+
+def record_forward(name: str, lport: int, rport: int) -> None:
+    """Track a forward in session state, replacing any prior entry on lport."""
+    s = Sessions.load(name)
+    forwards = [(l, r) for l, r in parse_forwards(s.get("FORWARDS", "")) if l != lport]
+    forwards.append((lport, rport))
+    s["FORWARDS"] = format_forwards(forwards)
+    Sessions.save(name, s)
+
+
 def parse_kv(blob: str) -> dict:
     out: dict = {}
     for line in (blob or "").splitlines():
@@ -605,6 +625,14 @@ def push_env_file(ssh: SSH, env_cmd: str, state_remote_dir: str) -> None:
                 input_data=body)
     else:
         ssh.run(f"rm -f {state_remote_dir}/env.sh", check=False)
+
+
+def hours_to_walltime(hours: float) -> str:
+    """Convert an --hours value (possibly fractional) to Slurm HH:MM:SS."""
+    minutes = round(hours * 60)
+    if minutes <= 0:
+        die(f"--hours must be positive (got {hours:g})")
+    return f"{minutes // 60:02d}:{minutes % 60:02d}:00"
 
 
 def build_sbatch_flags(profile: dict) -> list[str]:
@@ -980,6 +1008,8 @@ def cmd_up(args, cfg: Config) -> None:
     # 'stale' has been auto-cleaned; 'missing' is the green path. Both proceed.
 
     resolved  = cfg.resolve_profile(profile)
+    if args.hours is not None:
+        resolved["time"] = hours_to_walltime(args.hours)
     base_port = args.port or cfg.local_port
     lport     = pick_free_port(base_port, reserved=reserved_local_ports(exclude_name=name))
 
@@ -1339,6 +1369,19 @@ def cmd_tunnel_up(args, cfg: Config) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_forward_up(args, cfg: Config) -> None:
+    pairs = [parse_port_spec(tok) for tok in args.ports]
+    if args.remote is not None:
+        if len(pairs) > 1:
+            die("--remote works with a single PORT; use LOCAL:REMOTE pairs for multiple")
+        if ":" in args.ports[0]:
+            die(f"--remote conflicts with {args.ports[0]!r}; pass one or the other")
+        pairs = [(pairs[0][0], args.remote)]
+    seen: set[int] = set()
+    for lport, _ in pairs:
+        if lport in seen:
+            die(f"local port {lport} given more than once")
+        seen.add(lport)
+
     name  = resolve_name_for_read(args.name)
     ssh   = SSH(cfg.host)
     slurm = Slurm(ssh)
@@ -1348,15 +1391,13 @@ def cmd_forward_up(args, cfg: Config) -> None:
     node = args.node or s.get("NODE")
     if not node:
         die(f"session '{name}' has no NODE — pass --node, or wait for the job to start")
-    rport = args.remote if args.remote is not None else args.port
-    spec  = f"{args.port}:{node}:{rport}"
-    forward_or_die(ssh, spec, args.port, "pass a different port")
-    s = Sessions.load(name)
-    forwards = [(l, r) for l, r in parse_forwards(s.get("FORWARDS", "")) if l != args.port]
-    forwards.append((args.port, rport))
-    s["FORWARDS"] = format_forwards(forwards)
-    Sessions.save(name, s)
-    print(f"Forward up: localhost:{args.port} -> {node}:{rport}  (session={name})")
+    # Record after each successful forward so a failure partway through still
+    # leaves the already-open ones tracked (and torn down later by `down`).
+    for lport, rport in pairs:
+        spec = f"{lport}:{node}:{rport}"
+        forward_or_die(ssh, spec, lport, "pass a different port")
+        record_forward(name, lport, rport)
+        print(f"Forward up: localhost:{lport} -> {node}:{rport}  (session={name})")
 
 
 def cmd_forward_down(args, cfg: Config) -> None:
@@ -1371,24 +1412,28 @@ def cmd_forward_down(args, cfg: Config) -> None:
     if not s:
         die(f"session '{name}' has no local state; nothing to tear down")
     forwards = parse_forwards(s.get("FORWARDS", ""))
-    match = next(((l, r) for l, r in forwards if l == args.port), None)
-    if not match:
-        die(f"no tracked forward on port {args.port} for session '{name}'")
+    by_lport = dict(forwards)
+    ports = list(dict.fromkeys(args.ports))
+    unknown = [p for p in ports if p not in by_lport]
+    if unknown:
+        die(f"no tracked forward on port(s) {', '.join(str(p) for p in unknown)} "
+            f"for session '{name}'")
     node = s.get("NODE")
     if not node:
         die(f"session '{name}' has no NODE; cannot derive forward spec")
-    lport, rport = match
-    try:
-        ssh.cancel_forward(f"{lport}:{node}:{rport}")
-    except Exception:
-        pass  # best-effort, matches close_session_forwards
-    remaining = [(l, r) for l, r in forwards if l != lport]
+    for lport in ports:
+        rport = by_lport[lport]
+        try:
+            ssh.cancel_forward(f"{lport}:{node}:{rport}")
+        except Exception:
+            pass  # best-effort, matches close_session_forwards
+        print(f"Forward down: localhost:{lport} -> {node}:{rport}")
+    remaining = [(l, r) for l, r in forwards if l not in set(ports)]
     if remaining:
         s["FORWARDS"] = format_forwards(remaining)
     else:
         s.pop("FORWARDS", None)
     Sessions.save(name, s)
-    print(f"Forward down: localhost:{lport} -> {node}:{rport}")
 
 
 def cmd_forward_list(args, cfg: Config) -> None:
@@ -1551,6 +1596,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--profile", help=f"profile name (default: from config, e.g. gpu/cpu)")
     sp.add_argument("--name", help="session name (default: 'default')")
     sp.add_argument("--port", type=int, help="local port base (auto-bumped if busy)")
+    sp.add_argument("--hours", type=float,
+                    help="walltime in hours, overrides the profile's time (e.g. --hours 10)")
     sp.set_defaults(fn=cmd_up)
 
     sp = sub.add_parser("down", help="tear down a session (or all)",
@@ -1607,17 +1654,21 @@ def build_parser() -> argparse.ArgumentParser:
                                     "Forwards are tracked in session state and torn down on `down`.")
     fsub = sp.add_subparsers(dest="forward_cmd", required=True, metavar="<action>")
 
-    fsp = fsub.add_parser("up", help="open a port forward to the session's node",
-                          description="localhost:PORT -> NODE:REMOTE (default REMOTE=PORT).")
-    fsp.add_argument("port", type=int, help="local port to listen on")
-    fsp.add_argument("--remote", type=int, help="remote port on the node (default: same as local)")
+    fsp = fsub.add_parser("up", help="open port forwards to the session's node",
+                          description="localhost:LOCAL -> NODE:REMOTE for each spec "
+                                      "(default REMOTE=LOCAL). Several specs may be given.")
+    fsp.add_argument("ports", nargs="+", metavar="PORT[:REMOTE]",
+                     help="local port, or LOCAL:REMOTE pair; several may be given")
+    fsp.add_argument("--remote", type=int,
+                     help="remote port on the node (single PORT only; default: same as local)")
     fsp.add_argument("--node", help="override target node (default: session's NODE)")
     fsp.add_argument("--name", help="session name (default: sole tracked session)")
     fsp.set_defaults(fn=cmd_forward_up)
 
-    fsp = fsub.add_parser("down", help="close a tracked forward",
-                          description="Cancels the forward and drops it from session state.")
-    fsp.add_argument("port", type=int, help="local port of the forward to close")
+    fsp = fsub.add_parser("down", help="close tracked forwards",
+                          description="Cancels the forward(s) and drops them from session state.")
+    fsp.add_argument("ports", type=int, nargs="+", metavar="PORT",
+                     help="local port(s) of the forward(s) to close")
     fsp.add_argument("--name", help="session name (default: sole tracked session)")
     fsp.set_defaults(fn=cmd_forward_down)
 

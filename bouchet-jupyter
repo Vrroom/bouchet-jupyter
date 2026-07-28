@@ -481,6 +481,20 @@ def port_in_use(p: int) -> bool:
             return True
 
 
+def listener_description(port: int) -> str:
+    """Best-effort '<command> (pid N)' for whatever listens on `port` locally.
+
+    Empty when `ss` is unavailable or the socket belongs to another user — it
+    only reports process details for sockets we own."""
+    try:
+        out = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', out)
+    return f"{m.group(1)} (pid {m.group(2)})" if m else ""
+
+
 def pick_free_port(base: int, span: int = 50, *,
                    reserved: set[int] = frozenset()) -> int:
     for p in range(base, base + span):
@@ -547,6 +561,25 @@ def record_forward(name: str, lport: int, rport: int) -> None:
     Sessions.save(name, s)
 
 
+def tracked_forward_owner(lport: int, *, exclude_tunnel_of: str | None = None
+                          ) -> tuple[str, str]:
+    """Which of our own sessions claims local port `lport`.
+
+    Returns (description, command-that-frees-it); the command is empty when
+    there is no targeted way to release it. `exclude_tunnel_of` skips one
+    session's primary tunnel so `tunnel up` doesn't report a session as
+    colliding with itself while re-opening its own port."""
+    for n in Sessions.list_names():
+        s = Sessions.load(n)
+        for l, r in parse_forwards(s.get("FORWARDS", "")):
+            if l == lport:
+                return (f"the forward from session '{n}' to node port {r}",
+                        f"bouchet-jupyter forward down {lport} --name {n}")
+        if n != exclude_tunnel_of and (s.get("LOCAL_PORT") or "").strip() == str(lport):
+            return (f"the jupyter tunnel for session '{n}'", "")
+    return ("", "")
+
+
 def parse_kv(blob: str) -> dict:
     out: dict = {}
     for line in (blob or "").splitlines():
@@ -588,15 +621,40 @@ def fmt_eta(start: str) -> str:
     return f"in {m}m"
 
 
-def forward_or_die(ssh: SSH, spec: str, port: int, port_busy_hint: str) -> None:
-    """Open an SSH port forward, translating port-collision errors to a friendly die."""
+def forward_failure_reason(host: str, port: int, err: str, port_busy_hint: str,
+                           exclude_tunnel_of: str | None = None) -> str:
+    """Explain why `ssh -O forward` refused, since ssh itself won't say.
+
+    The mux client hands the request to the ControlMaster, and the master keeps
+    the real cause ("Address already in use", ...) on its own stderr — all that
+    comes back is "Port forwarding failed". So probe the local port instead of
+    pattern-matching an error string that never carries the reason."""
+    # Privileged ports first: port_in_use() cannot tell "someone else has it"
+    # from "this user may not bind it" — both surface as OSError on bind.
+    if port < 1024 and os.geteuid() != 0:
+        return (f"local port {port} is privileged (below 1024); ssh cannot bind it "
+                f"as this user, so {port_busy_hint}")
+    if port_in_use(port):
+        who, how_to_free = tracked_forward_owner(port, exclude_tunnel_of=exclude_tunnel_of)
+        if not who:
+            who = listener_description(port) or "another process"
+        fix = f"close it with '{how_to_free}', or {port_busy_hint}" if how_to_free \
+              else port_busy_hint
+        return f"local port {port} is already in use by {who}; {fix}"
+    detail = err.removeprefix("tunnel forward failed: ")
+    return (f"ssh refused the forward without saying why, and local port {port} is free. "
+            f"The ControlMaster keeps the real reason on its own stderr; check that it is "
+            f"still alive with 'ssh -O check {host}'.\n  ssh said: {detail}")
+
+
+def forward_or_die(ssh: SSH, spec: str, port: int, port_busy_hint: str, *,
+                   session: str | None = None) -> None:
+    """Open an SSH port forward, or die explaining what actually went wrong."""
     try:
         ssh.forward(spec)
     except SSHError as e:
-        msg = str(e)
-        if "in use" in msg or "Address already in use" in msg or "cannot listen" in msg.lower():
-            die(f"local port {port} is in use by another process; {port_busy_hint}")
-        die(f"forward failed: {msg}")
+        die(f"forward failed: "
+            f"{forward_failure_reason(ssh.host, port, str(e), port_busy_hint, session)}")
 
 
 def close_session_forwards(name: str, ssh: SSH, payload: dict) -> None:
@@ -615,6 +673,13 @@ def close_session_forwards(name: str, ssh: SSH, payload: dict) -> None:
                 ssh.cancel_forward(f"{lport}:{node}:{rport}")
             except Exception:
                 pass
+
+
+def remove_remote_session_file(name: str, ssh: SSH, cfg: Config) -> None:
+    """Delete the cluster-side session file. Best-effort: it is usually already
+    gone (the launcher's EXIT trap removes it), but SIGKILL / node failure
+    bypasses that trap and leaves it behind."""
+    ssh.run(f"rm -f {cfg.state_remote_dir}/session.{shlex.quote(name)}", check=False)
 
 
 def push_env_file(ssh: SSH, env_cmd: str, state_remote_dir: str) -> None:
@@ -685,6 +750,7 @@ class SessionView:
     age_s: int              # seconds since SYNCED_AT (0 after a fresh pull)
     notes: list[str] = field(default_factory=list)
     extras: dict = field(default_factory=dict)  # display-only: elapsed/limit/reason
+    remote_is_ours: bool = True                 # cluster file describes THIS job
 
 
 def local_age_s(payload: dict) -> int:
@@ -709,9 +775,17 @@ def is_terminal(sacct_out: str) -> bool:
     return head in TERMINAL_SACCT
 
 
-def autoclean_session(name: str, payload: dict, ssh: SSH, notes: list[str]) -> None:
+def autoclean_session(name: str, payload: dict, ssh: SSH, cfg: Config,
+                      notes: list[str], *, remote_is_ours: bool = True) -> None:
+    """Drop every trace of a session whose job has ended: forwards, local file,
+    and the cluster file. Clearing the cluster file matters — leaving it behind
+    lets the next command resurrect the dead session from the remote side and
+    dead-end on 'stale_unverified', since the local JOB_ID needed to check
+    squeue/sacct is gone."""
     close_session_forwards(name, ssh, payload)
     Sessions.session_path(name).unlink(missing_ok=True)
+    if remote_is_ours:
+        remove_remote_session_file(name, ssh, cfg)
     jid = payload.get("JOB_ID", "?")
     notes.append(f"[{name}] cleaned stale (job {jid} ended)")
 
@@ -782,6 +856,16 @@ def remote_job_matches(local: dict, remote: dict) -> bool:
     return bool(r) and l == r
 
 
+def remote_file_is_ours(local: dict, remote: dict) -> bool:
+    """True when the cluster session file belongs to the session we're cleaning.
+
+    A file naming a *different* JOB_ID is a newer session's (someone ran `up`
+    from another machine) — deleting it would strand that session's
+    NODE/PORT/TOKEN. A file naming no job at all cannot describe anything live,
+    so it counts as leftover."""
+    return not remote.get("JOB_ID", "").strip() or remote_job_matches(local, remote)
+
+
 def merge_remote(local: dict, remote: dict) -> dict:
     """Cluster owns NODE/PORT/TOKEN/JOB_ID for the current job; local owns the rest.
 
@@ -800,12 +884,20 @@ def merge_remote(local: dict, remote: dict) -> dict:
 def ssh_one_session(ssh: SSH, slurm: Slurm, cfg: Config, name: str
                      ) -> tuple[bool, dict, str | None, dict, str | None]:
     """Return (squeue_ok, remote, squeue_state, squeue_extras, sacct_state)."""
-    payload_local = Sessions.load(name)
-    job_id = payload_local.get("JOB_ID", "")
+    local_job_id = Sessions.load(name).get("JOB_ID", "").strip()
     rfile = f"{cfg.state_remote_dir}/session.{shlex.quote(name)}"
-    parts = ["echo ==CAT==", f"cat {rfile} 2>/dev/null", "echo ==SQ=="]
-    if job_id:
-        parts.append(f"squeue -h -j {shlex.quote(job_id)} -o '%T|%R|%M|%l' 2>/dev/null")
+    # Local JOB_ID is authoritative — it's what we submitted. When there isn't
+    # one (adopt of a cluster-only session, or a leftover file after an
+    # autoclean), read the id straight out of the remote file in the same round
+    # trip so the job still gets checked; sync_all does the same fallback and
+    # the two must agree, or the same session classifies differently per command.
+    if local_job_id:
+        squeue_cmd = f"squeue -h -j {shlex.quote(local_job_id)} -o '%T|%R|%M|%l' 2>/dev/null"
+    else:
+        squeue_cmd = (f"jid=$(sed -n 's/^JOB_ID=//p' {rfile} 2>/dev/null | head -1) ; "
+                      f'if [ -n "$jid" ] ; then '
+                      f"squeue -h -j \"$jid\" -o '%T|%R|%M|%l' 2>/dev/null ; fi")
+    parts = ["echo ==CAT==", f"cat {rfile} 2>/dev/null", "echo ==SQ==", squeue_cmd]
     try:
         out = ssh.run(" ; ".join(parts), check=False, retry=True)
     except SSHError:
@@ -813,6 +905,7 @@ def ssh_one_session(ssh: SSH, slurm: Slurm, cfg: Config, name: str
     cat_block, _, sq_block = out.partition("==SQ==")
     cat_block = cat_block.replace("==CAT==", "").strip("\n")
     remote = parse_kv(cat_block)
+    job_id = local_job_id or remote.get("JOB_ID", "").strip()
     sq_state: str | None = None
     extras: dict = {}
     if job_id and sq_block.strip():
@@ -850,9 +943,10 @@ def sync_one(name: str, ssh: SSH, slurm: Slurm, cfg: Config,
                        remote_job_matches(local, remote),
                        sq_state, squeue_ok, sacct_state)
     payload = merge_remote(local, remote)
+    remote_is_ours = remote_file_is_ours(local, remote)
     notes: list[str] = []
     if status == "stale" and autoclean and (local or remote):
-        autoclean_session(name, payload, ssh, notes)
+        autoclean_session(name, payload, ssh, cfg, notes, remote_is_ours=remote_is_ours)
         payload = {}
     elif status in ("live", "launching") and (local or remote):
         Sessions.save(name, payload)
@@ -860,7 +954,7 @@ def sync_one(name: str, ssh: SSH, slurm: Slurm, cfg: Config,
     return SessionView(name=name, status=status, payload=payload,
                        job_state=sq_state,
                        age_s=0 if squeue_ok else age,
-                       notes=notes, extras=extras)
+                       notes=notes, extras=extras, remote_is_ours=remote_is_ours)
 
 
 def sync_all(ssh: SSH, slurm: Slurm, cfg: Config,
@@ -939,9 +1033,10 @@ def sync_all(ssh: SSH, slurm: Slurm, cfg: Config,
                            remote_job_matches(local, remote),
                            sq_state, squeue_ok, sacct_state)
         payload = merge_remote(local, remote)
+        remote_is_ours = remote_file_is_ours(local, remote)
         notes: list[str] = []
         if status == "stale" and autoclean and (local or remote):
-            autoclean_session(n, payload, ssh, notes)
+            autoclean_session(n, payload, ssh, cfg, notes, remote_is_ours=remote_is_ours)
             payload = {}
         elif status in ("live", "launching") and (local or remote):
             Sessions.save(n, payload)
@@ -950,7 +1045,8 @@ def sync_all(ssh: SSH, slurm: Slurm, cfg: Config,
                                job_state=sq_state,
                                age_s=0 if squeue_ok else local_age_s(local),
                                notes=notes,
-                               extras=live_extras.get(job_id, {}) if job_id else {})
+                               extras=live_extras.get(job_id, {}) if job_id else {},
+                               remote_is_ours=remote_is_ours)
     return views
 
 
@@ -1034,7 +1130,8 @@ def cmd_up(args, cfg: Config) -> None:
                 break
             if view.status in ("stale", "winding_down"):
                 notes: list[str] = []
-                autoclean_session(name, view.payload, ssh, notes)
+                autoclean_session(name, view.payload, ssh, cfg, notes,
+                                  remote_is_ours=view.remote_is_ours)
                 for note in notes:
                     print(note, file=sys.stderr)
                 die(f"  job {job_id} left the queue ({view.status}) — aborting")
@@ -1075,7 +1172,7 @@ def down_one(name: str, ssh: SSH, cfg: Config) -> None:
     if s.get("JOB_ID"):
         Slurm(ssh).cancel(s["JOB_ID"])
         print(f"[{name}] scancelled {s['JOB_ID']}")
-    ssh.run(f"rm -f {cfg.state_remote_dir}/session.{shlex.quote(name)}", check=False)
+    remove_remote_session_file(name, ssh, cfg)
     print(f"[{name}] tunnel down")
 
 
@@ -1355,7 +1452,8 @@ def cmd_tunnel_up(args, cfg: Config) -> None:
         # `tunnel up` can re-open a tunnel that ssh's mux still thinks exists.
         ssh.cancel_forward(old_spec)
 
-    forward_or_die(ssh, spec, lport, "pass --port NEW to pick a different one")
+    forward_or_die(ssh, spec, lport, "pass --port NEW to pick a different one",
+                   session=name)
     atomic_write_text(Sessions.tunnel_path(name), spec + "\n")
     if str(lport) != s.get("LOCAL_PORT"):
         s["LOCAL_PORT"] = str(lport)
@@ -1395,7 +1493,9 @@ def cmd_forward_up(args, cfg: Config) -> None:
     # leaves the already-open ones tracked (and torn down later by `down`).
     for lport, rport in pairs:
         spec = f"{lport}:{node}:{rport}"
-        forward_or_die(ssh, spec, lport, "pass a different port")
+        forward_or_die(ssh, spec, lport,
+                       f"pick a free local port instead: "
+                       f"'bouchet-jupyter forward up {lport + 1}:{rport}'")
         record_forward(name, lport, rport)
         print(f"Forward up: localhost:{lport} -> {node}:{rport}  (session={name})")
 

@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 try:
     import tomllib  # Python 3.11+ stdlib
@@ -273,16 +273,17 @@ class Slurm:
                session_name: str, state_remote_dir: str) -> str:
         """Submit and return JOB_ID, with double-capture for race resilience.
 
-        Also clears any preexisting session.$name file before sbatch runs — if a
-        previous job died without its cleanup trap firing (SIGKILL / node failure),
-        the leftover file would otherwise be readable by polling before the new
-        launcher's atomic write, and the laptop would tunnel to the wrong node.
+        Also clears any legacy session.$name file before sbatch runs. Files in
+        the current layout carry the job id in their name, so a leftover cannot
+        be confused with this job's — but one written before that convention
+        would be readable by polling before the new launcher's atomic write, and
+        the laptop would tunnel to the wrong node.
 
         Paths (state_remote_dir / sbatch_dir) carry literal `$HOME` from config —
         keep them unquoted so the remote shell expands them. session_name is
         validated upstream (see validate_name)."""
         marker       = f"{state_remote_dir}/last-submit.{session_name}.id"
-        session_file = f"{state_remote_dir}/session.{shlex.quote(session_name)}"
+        session_file = remote_session_file(state_remote_dir, session_name)
         flags  = " ".join(shlex.quote(f) for f in sbatch_flags)
         cmd = (f"mkdir -p {state_remote_dir} && rm -f {marker} {session_file} && "
                f"cd {sbatch_dir} && "
@@ -523,6 +524,69 @@ def reserved_local_ports(exclude_name: str | None = None) -> set[int]:
     return out
 
 
+# Cluster session files are named "session.<NAME>@<JOB_ID>". The job id makes a
+# file left behind by a dead job unmistakable, so nothing has to guess whether a
+# file describes the job we are tracking. "@" separates it because session names
+# may contain "." (see NAME_RE) but never "@", so the split is unambiguous.
+# Files written before this convention ("session.<NAME>") are still read; they
+# carry their job id inside instead.
+JOB_SEP = "@"
+
+
+def remote_session_file(state_remote_dir: str, name: str, job_id: str = "") -> str:
+    """Cluster path of one session file. Omitting `job_id` gives the legacy path."""
+    tail = f"{JOB_SEP}{job_id}" if job_id else ""
+    return f"{state_remote_dir}/session.{shlex.quote(name + tail)}"
+
+
+def remote_session_patterns(state_remote_dir: str, name: str = "") -> str:
+    """Shell patterns covering every session file (optionally for one name):
+    the per-job files plus the legacy job-less one.
+
+    Anchored on the "@" so that name 'default' cannot also match the files of a
+    session called 'default2'."""
+    if not name:
+        return f"{state_remote_dir}/session.*"
+    stem = f"{state_remote_dir}/session.{shlex.quote(name)}"
+    return f"{stem}{JOB_SEP}* {stem}"
+
+
+def parse_session_filename(basename: str) -> tuple[str, str] | None:
+    """'session.<name>@<job>' -> (name, job); legacy 'session.<name>' -> (name, '').
+
+    Returns None for anything that isn't a session file."""
+    if not basename.startswith("session."):
+        return None
+    rest = basename[len("session."):]
+    name, sep, job = rest.partition(JOB_SEP)
+    return (name, job) if sep else (rest, "")
+
+
+def session_file_job(job_id: str, payload: dict) -> str:
+    """The job a session file describes: from its name, or from inside it when
+    the file predates the per-job naming convention."""
+    return job_id or payload.get("JOB_ID", "").strip()
+
+
+def select_session_file(files: dict[str, dict], live_jobs: set[str],
+                        local_job_id: str) -> tuple[str, dict]:
+    """Pick which of a name's cluster files describes the session now.
+
+    `files` maps the filename's job id ("" for a legacy file) to its payload.
+    Preference: the job we are already tracking, then a job the cluster still
+    lists, then the newest — so a leftover can never outrank a live session."""
+    if not files:
+        return "", {}
+    if local_job_id:
+        for jid, payload in files.items():
+            if session_file_job(jid, payload) == local_job_id:
+                return jid, payload
+    live = [j for j, p in files.items() if session_file_job(j, p) in live_jobs]
+    pool = live or list(files)
+    newest = max(pool, key=lambda j: int(session_file_job(j, files[j]) or 0))
+    return newest, files[newest]
+
+
 def parse_forwards(s: str) -> list[tuple[int, int]]:
     out: list[tuple[int, int]] = []
     for tok in (s or "").split(","):
@@ -675,11 +739,20 @@ def close_session_forwards(name: str, ssh: SSH, payload: dict) -> None:
                 pass
 
 
-def remove_remote_session_file(name: str, ssh: SSH, cfg: Config) -> None:
-    """Delete the cluster-side session file. Best-effort: it is usually already
-    gone (the launcher's EXIT trap removes it), but SIGKILL / node failure
-    bypasses that trap and leaves it behind."""
-    ssh.run(f"rm -f {cfg.state_remote_dir}/session.{shlex.quote(name)}", check=False)
+def remove_remote_session_files(name: str, ssh: SSH, cfg: Config,
+                                job_ids: list[str]) -> None:
+    """Delete specific cluster-side session files for `name` (job id "" is the
+    legacy job-less file). Best-effort: they are usually already gone, since the
+    launcher's EXIT trap removes them, but SIGKILL / node failure bypasses it."""
+    paths = [remote_session_file(cfg.state_remote_dir, name, j) for j in job_ids]
+    if paths:
+        ssh.run(f"rm -f {' '.join(paths)}", check=False)
+
+
+def remove_all_remote_session_files(name: str, ssh: SSH, cfg: Config) -> None:
+    """Delete every cluster file for `name`, both layouts. For `down`, which is
+    meant to leave nothing behind."""
+    ssh.run(f"rm -f {remote_session_patterns(cfg.state_remote_dir, name)}", check=False)
 
 
 def push_env_file(ssh: SSH, env_cmd: str, state_remote_dir: str) -> None:
@@ -716,7 +789,8 @@ def resolve_name_for_read(arg_name: str | None) -> str:
         return validate_name(arg_name)
     names = Sessions.list_names()
     if not names:
-        die("no tracked sessions — run 'bouchet-jupyter up' first")
+        die("no tracked sessions — run 'bouchet-jupyter up' to start one, or "
+            "'bouchet-jupyter adopt' if a session is already running on the cluster")
     if len(names) == 1:
         return names[0]
     die("multiple sessions tracked — pass --name <NAME>:\n  " + "\n  ".join(names))
@@ -751,6 +825,7 @@ class SessionView:
     notes: list[str] = field(default_factory=list)
     extras: dict = field(default_factory=dict)  # display-only: elapsed/limit/reason
     remote_is_ours: bool = True                 # cluster file describes THIS job
+    remote_job_file: str = ""                   # job id of the cluster file read
 
 
 def local_age_s(payload: dict) -> int:
@@ -776,7 +851,8 @@ def is_terminal(sacct_out: str) -> bool:
 
 
 def autoclean_session(name: str, payload: dict, ssh: SSH, cfg: Config,
-                      notes: list[str], *, remote_is_ours: bool = True) -> None:
+                      notes: list[str], *, remote_is_ours: bool = True,
+                      remote_job_file: str = "") -> None:
     """Drop every trace of a session whose job has ended: forwards, local file,
     and the cluster file. Clearing the cluster file matters — leaving it behind
     lets the next command resurrect the dead session from the remote side and
@@ -785,9 +861,11 @@ def autoclean_session(name: str, payload: dict, ssh: SSH, cfg: Config,
     close_session_forwards(name, ssh, payload)
     Sessions.session_path(name).unlink(missing_ok=True)
     if remote_is_ours:
-        remove_remote_session_file(name, ssh, cfg)
+        remove_remote_session_files(name, ssh, cfg, [remote_job_file])
     jid = payload.get("JOB_ID", "?")
-    notes.append(f"[{name}] cleaned stale (job {jid} ended)")
+    note = f"[{name}] cleaned stale (job {jid} ended)"
+    if note not in notes:
+        notes.append(note)
 
 
 def print_notes(view: SessionView) -> None:
@@ -881,50 +959,181 @@ def merge_remote(local: dict, remote: dict) -> dict:
     return payload
 
 
-def ssh_one_session(ssh: SSH, slurm: Slurm, cfg: Config, name: str
-                     ) -> tuple[bool, dict, str | None, dict, str | None]:
-    """Return (squeue_ok, remote, squeue_state, squeue_extras, sacct_state)."""
+def cluster_probe_command(state_remote_dir: str, name: str = "") -> str:
+    """One round trip: the session files (all, or just one name's) plus this
+    user's jupyter jobs. Both sync paths issue this, so they cannot disagree
+    about which file or which job state describes a session."""
+    return (
+        'echo ==FILES== ; '
+        f'for f in {remote_session_patterns(state_remote_dir, name)} ; do '
+        '  [ -e "$f" ] || continue ; '
+        '  echo "==FILE==$(basename "$f")" ; '
+        '  cat "$f" ; '
+        'done ; '
+        'echo ==SQUEUE== ; '
+        'squeue --me --name=jupyter -h -o "%i|%T|%R|%M|%l|%N" 2>/dev/null'
+    )
+
+
+@dataclass
+class ClusterSnapshot:
+    """One round trip's worth of cluster truth."""
+    files: dict[str, dict[str, dict]] = field(default_factory=dict)  # name -> job id -> payload
+    live_jobs: dict[str, str] = field(default_factory=dict)          # job id -> squeue state
+    live_extras: dict[str, dict] = field(default_factory=dict)       # job id -> display fields
+    ok: bool = True
+
+    @staticmethod
+    def fetch(ssh: SSH, cfg: Config, name: str = "") -> "ClusterSnapshot":
+        try:
+            out = ssh.run(cluster_probe_command(cfg.state_remote_dir, name),
+                          check=False, retry=True)
+        except SSHError:
+            return ClusterSnapshot(ok=False)
+        files_block, _, squeue_block = out.partition("==SQUEUE==")
+        snap = ClusterSnapshot(files=parse_files_block(files_block))
+        snap.live_jobs, snap.live_extras = parse_squeue_block(squeue_block)
+        return snap
+
+
+def parse_files_block(block: str) -> dict[str, dict[str, dict]]:
+    """'==FILE==<basename>' sections -> {session name: {file job id: payload}}."""
+    out: dict[str, dict[str, dict]] = {}
+    cur: tuple[str, str] | None = None
+    lines: list[str] = []
+
+    def flush() -> None:
+        if cur is not None:
+            out.setdefault(cur[0], {})[cur[1]] = parse_kv("\n".join(lines))
+
+    for line in block.splitlines():
+        if line.startswith("==FILES=="):
+            continue
+        if line.startswith("==FILE=="):
+            flush()
+            cur = parse_session_filename(line[len("==FILE=="):].strip())
+            lines = []
+        elif cur is not None:
+            lines.append(line)
+    flush()
+    return out
+
+
+def parse_squeue_block(block: str) -> tuple[dict[str, str], dict[str, dict]]:
+    """squeue '%i|%T|%R|%M|%l|%N' rows -> (job id -> state, job id -> extras)."""
+    live_jobs: dict[str, str] = {}
+    live_extras: dict[str, dict] = {}
+    for line in (block or "").splitlines():
+        parts = line.split("|")
+        if len(parts) >= 2 and parts[0].strip().isdigit():
+            jid = parts[0].strip()
+            live_jobs[jid] = parts[1].strip()
+            extra: dict = {}
+            for key, idx in (("reason", 2), ("elapsed", 3), ("limit", 4), ("node", 5)):
+                if len(parts) > idx:
+                    extra[key] = parts[idx].strip().strip("()") if key == "reason" \
+                                 else parts[idx].strip()
+            live_extras[jid] = extra
+    return live_jobs, live_extras
+
+
+def probe_from_snapshot(name: str, snap: ClusterSnapshot, slurm: Slurm) -> ClusterProbe:
+    """Judge one session against a snapshot: which file is current, and how its
+    job looks. Local JOB_ID is authoritative — it's what we submitted; without
+    one (adopt of a cluster-only session) the file's own job id is used."""
     local_job_id = Sessions.load(name).get("JOB_ID", "").strip()
-    rfile = f"{cfg.state_remote_dir}/session.{shlex.quote(name)}"
-    # Local JOB_ID is authoritative — it's what we submitted. When there isn't
-    # one (adopt of a cluster-only session, or a leftover file after an
-    # autoclean), read the id straight out of the remote file in the same round
-    # trip so the job still gets checked; sync_all does the same fallback and
-    # the two must agree, or the same session classifies differently per command.
-    if local_job_id:
-        squeue_cmd = f"squeue -h -j {shlex.quote(local_job_id)} -o '%T|%R|%M|%l' 2>/dev/null"
-    else:
-        squeue_cmd = (f"jid=$(sed -n 's/^JOB_ID=//p' {rfile} 2>/dev/null | head -1) ; "
-                      f'if [ -n "$jid" ] ; then '
-                      f"squeue -h -j \"$jid\" -o '%T|%R|%M|%l' 2>/dev/null ; fi")
-    parts = ["echo ==CAT==", f"cat {rfile} 2>/dev/null", "echo ==SQ==", squeue_cmd]
-    try:
-        out = ssh.run(" ; ".join(parts), check=False, retry=True)
-    except SSHError:
-        return False, {}, None, {}, None
-    cat_block, _, sq_block = out.partition("==SQ==")
-    cat_block = cat_block.replace("==CAT==", "").strip("\n")
-    remote = parse_kv(cat_block)
-    job_id = local_job_id or remote.get("JOB_ID", "").strip()
-    sq_state: str | None = None
-    extras: dict = {}
-    if job_id and sq_block.strip():
-        f = sq_block.strip().split("|")
-        if len(f) >= 1:
-            sq_state = f[0]
-        if len(f) >= 2:
-            extras["reason"] = f[1].strip("()")
-        if len(f) >= 3:
-            extras["elapsed"] = f[2]
-        if len(f) >= 4:
-            extras["limit"] = f[3]
+    file_job, remote = select_session_file(snap.files.get(name, {}),
+                                           set(snap.live_jobs), local_job_id)
+    job_id = local_job_id or session_file_job(file_job, remote)
+    sq_state = snap.live_jobs.get(job_id) if job_id else None
     sacct_state: str | None = None
-    if job_id and not sq_state:
+    if snap.ok and job_id and not sq_state:
         try:
             sacct_state = slurm.final_state(job_id)
         except SSHError:
             sacct_state = None
-    return True, remote, sq_state, extras, sacct_state
+    return ClusterProbe(remote=remote, sq_state=sq_state, sacct_state=sacct_state,
+                        extras=snap.live_extras.get(job_id, {}) if job_id else {},
+                        squeue_ok=snap.ok, remote_job_file=file_job)
+
+
+def sweep_dead_session_files(name: str, snap: ClusterSnapshot, keep: str,
+                             ssh: SSH, cfg: Config) -> None:
+    """Remove this name's per-job files whose job the cluster no longer lists.
+
+    The launcher's trap normally deletes its own file; a SIGKILLed job leaves
+    one behind. Per-job names mean a leftover can't shadow a live session, but
+    it would pile up forever, so drop it once its job is out of the queue."""
+    doomed = [j for j, payload in snap.files.get(name, {}).items()
+              if j and j != keep and session_file_job(j, payload) not in snap.live_jobs]
+    if doomed:
+        remove_remote_session_files(name, ssh, cfg, doomed)
+
+
+# Laptop-side preferences, not job state: they survive a session being replaced
+# by a newer job on the cluster. SUBMITTED_AT deliberately isn't here — carrying
+# it would make the new job look like it is still inside the submit grace window.
+CARRY_ON_RECHECK = ("LOCAL_PORT", "PROFILE")
+
+
+@dataclass
+class ClusterProbe:
+    """What the cluster says about one session right now."""
+    remote: dict                          # parsed cluster session file
+    sq_state: str | None = None           # squeue %T for the job we're tracking
+    sacct_state: str | None = None        # sacct final state, when squeue has none
+    extras: dict = field(default_factory=dict)
+    squeue_ok: bool = True
+    remote_job_file: str = ""             # job id of the file read ("" = legacy layout)
+
+
+@dataclass
+class Settled:
+    """Outcome of judging one session against the cluster."""
+    status: SessionStatus
+    payload: dict
+    probe: ClusterProbe
+    remote_is_ours: bool
+    notes: list[str] = field(default_factory=list)
+
+
+def settle_session(name: str, probe_cluster: Callable[[], ClusterProbe],
+                   ssh: SSH, cfg: Config, *, autoclean: bool) -> Settled:
+    """Classify one session, autocleaning it when its job has ended.
+
+    `probe_cluster()` re-reads local state each time it is called, so a second
+    call after an autoclean sees the session the way a fresh command would."""
+    notes: list[str] = []
+    carried: dict = {}
+    for attempt in (1, 2):
+        local = {**carried, **Sessions.load(name)}
+        probe = probe_cluster()
+        remote = probe.remote
+        status = classify_status(local, bool(remote), bool(remote.get("TOKEN")),
+                           remote_job_matches(local, remote),
+                           probe.sq_state, probe.squeue_ok, probe.sacct_state)
+        payload = merge_remote(local, remote)
+        remote_is_ours = remote_file_is_ours(local, remote)
+        if status == "stale" and autoclean and (local or remote):
+            autoclean_session(name, payload, ssh, cfg, notes,
+                              remote_is_ours=remote_is_ours,
+                              remote_job_file=probe.remote_job_file)
+            payload = {}
+            # A dead local record can mask a *newer* job: an `up` from another
+            # machine leaves a cluster file naming a job this laptop never
+            # tracked, and the dead record is what we just classified. With it
+            # gone, judge the session on that file alone rather than reporting
+            # "stale" and making the user run the same command twice. Laptop-side
+            # preferences outlive the job they were recorded against, so carry
+            # them into the re-check instead of re-picking a local port.
+            if attempt == 1 and local and remote and not remote_is_ours:
+                carried = {k: local[k] for k in CARRY_ON_RECHECK if local.get(k)}
+                continue
+        elif status in ("live", "launching") and (local or remote):
+            Sessions.save(name, payload)
+            payload = Sessions.load(name)
+        return Settled(status=status, payload=payload, probe=probe,
+                       remote_is_ours=remote_is_ours, notes=notes)
 
 
 def sync_one(name: str, ssh: SSH, slurm: Slurm, cfg: Config,
@@ -938,115 +1147,38 @@ def sync_one(name: str, ssh: SSH, slurm: Slurm, cfg: Config,
             status="live" if local.get("TOKEN") else "launching",
             payload=local, job_state=None, age_s=age,
         )
-    squeue_ok, remote, sq_state, extras, sacct_state = ssh_one_session(ssh, slurm, cfg, name)
-    status = classify_status(local, bool(remote), bool(remote.get("TOKEN")),
-                       remote_job_matches(local, remote),
-                       sq_state, squeue_ok, sacct_state)
-    payload = merge_remote(local, remote)
-    remote_is_ours = remote_file_is_ours(local, remote)
-    notes: list[str] = []
-    if status == "stale" and autoclean and (local or remote):
-        autoclean_session(name, payload, ssh, cfg, notes, remote_is_ours=remote_is_ours)
-        payload = {}
-    elif status in ("live", "launching") and (local or remote):
-        Sessions.save(name, payload)
-        payload = Sessions.load(name)
-    return SessionView(name=name, status=status, payload=payload,
-                       job_state=sq_state,
-                       age_s=0 if squeue_ok else age,
-                       notes=notes, extras=extras, remote_is_ours=remote_is_ours)
+
+    # Re-fetch on each call: settle_session may clean state between attempts,
+    # and the second look has to see the cluster as a fresh command would.
+    def probe_cluster() -> ClusterProbe:
+        return probe_from_snapshot(name, ClusterSnapshot.fetch(ssh, cfg, name), slurm)
+
+    r = settle_session(name, probe_cluster, ssh, cfg, autoclean=autoclean)
+    return SessionView(name=name, status=r.status, payload=r.payload,
+                       job_state=r.probe.sq_state,
+                       age_s=0 if r.probe.squeue_ok else age,
+                       notes=r.notes, extras=r.probe.extras,
+                       remote_is_ours=r.remote_is_ours,
+                       remote_job_file=r.probe.remote_job_file)
 
 
 def sync_all(ssh: SSH, slurm: Slurm, cfg: Config,
              *, autoclean: bool = True) -> dict[str, SessionView]:
-    rdir = cfg.state_remote_dir
-    cmd = (
-        'echo ==FILES== ; '
-        f'for f in {rdir}/session.* ; do '
-        '  [ -e "$f" ] || continue ; '
-        '  echo "==FILE==$(basename $f)" ; '
-        '  cat "$f" ; '
-        'done ; '
-        'echo ==SQUEUE== ; '
-        'squeue --me --name=jupyter -h -o "%i|%T|%R|%M|%l|%N" 2>/dev/null'
-    )
-    try:
-        out = ssh.run(cmd, check=False, retry=True)
-        squeue_ok = True
-    except SSHError:
-        out, squeue_ok = "", False
-
-    files_block, _, squeue_block = out.partition("==SQUEUE==")
-    remote_by_name: dict[str, dict] = {}
-    cur_name: str | None = None
-    cur_lines: list[str] = []
-    for line in files_block.splitlines():
-        if line.startswith("==FILES=="):
-            continue
-        if line.startswith("==FILE=="):
-            if cur_name is not None:
-                remote_by_name[cur_name] = parse_kv("\n".join(cur_lines))
-            tag = line[len("==FILE=="):].strip()
-            cur_name = tag[len("session."):] if tag.startswith("session.") else tag
-            cur_lines = []
-        elif cur_name is not None:
-            cur_lines.append(line)
-    if cur_name is not None:
-        remote_by_name[cur_name] = parse_kv("\n".join(cur_lines))
-
-    live_jobs: dict[str, str] = {}
-    live_extras: dict[str, dict] = {}
-    for line in (squeue_block or "").splitlines():
-        parts = line.split("|")
-        if len(parts) >= 2 and parts[0].strip().isdigit():
-            jid = parts[0].strip()
-            live_jobs[jid] = parts[1].strip()
-            extra: dict = {}
-            if len(parts) >= 3:
-                extra["reason"] = parts[2].strip("()")
-            if len(parts) >= 4:
-                extra["elapsed"] = parts[3].strip()
-            if len(parts) >= 5:
-                extra["limit"] = parts[4].strip()
-            if len(parts) >= 6:
-                extra["node"] = parts[5].strip()
-            live_extras[jid] = extra
-
-    names = set(Sessions.list_names()) | set(remote_by_name.keys())
+    snap = ClusterSnapshot.fetch(ssh, cfg)
+    names = set(Sessions.list_names()) | set(snap.files)
     views: dict[str, SessionView] = {}
     for n in sorted(names):
-        local = Sessions.load(n)
-        remote = remote_by_name.get(n, {})
-        # Local JOB_ID is authoritative — it's what we submitted. Fall back to
-        # remote only when local hasn't pinned one yet (adopt of a cluster-only
-        # session). Reading remote first would let a stale leftover file pick
-        # the wrong job for squeue / sacct lookup.
-        job_id = (local.get("JOB_ID") or remote.get("JOB_ID") or "").strip()
-        sq_state = live_jobs.get(job_id) if job_id else None
-        sacct_state: str | None = None
-        if squeue_ok and job_id and not sq_state:
-            try:
-                sacct_state = slurm.final_state(job_id)
-            except SSHError:
-                sacct_state = None
-        status = classify_status(local, bool(remote), bool(remote.get("TOKEN")),
-                           remote_job_matches(local, remote),
-                           sq_state, squeue_ok, sacct_state)
-        payload = merge_remote(local, remote)
-        remote_is_ours = remote_file_is_ours(local, remote)
-        notes: list[str] = []
-        if status == "stale" and autoclean and (local or remote):
-            autoclean_session(n, payload, ssh, cfg, notes, remote_is_ours=remote_is_ours)
-            payload = {}
-        elif status in ("live", "launching") and (local or remote):
-            Sessions.save(n, payload)
-            payload = Sessions.load(n)
-        views[n] = SessionView(name=n, status=status, payload=payload,
-                               job_state=sq_state,
-                               age_s=0 if squeue_ok else local_age_s(local),
-                               notes=notes,
-                               extras=live_extras.get(job_id, {}) if job_id else {},
-                               remote_is_ours=remote_is_ours)
+        age = local_age_s(Sessions.load(n))
+        r = settle_session(n, lambda n=n: probe_from_snapshot(n, snap, slurm),
+                           ssh, cfg, autoclean=autoclean)
+        if autoclean and snap.ok:
+            sweep_dead_session_files(n, snap, r.probe.remote_job_file, ssh, cfg)
+        views[n] = SessionView(name=n, status=r.status, payload=r.payload,
+                               job_state=r.probe.sq_state,
+                               age_s=0 if snap.ok else age,
+                               notes=r.notes, extras=r.probe.extras,
+                               remote_is_ours=r.remote_is_ours,
+                               remote_job_file=r.probe.remote_job_file)
     return views
 
 
@@ -1131,7 +1263,8 @@ def cmd_up(args, cfg: Config) -> None:
             if view.status in ("stale", "winding_down"):
                 notes: list[str] = []
                 autoclean_session(name, view.payload, ssh, cfg, notes,
-                                  remote_is_ours=view.remote_is_ours)
+                                  remote_is_ours=view.remote_is_ours,
+                                  remote_job_file=view.remote_job_file)
                 for note in notes:
                     print(note, file=sys.stderr)
                 die(f"  job {job_id} left the queue ({view.status}) — aborting")
@@ -1150,9 +1283,21 @@ def cmd_up(args, cfg: Config) -> None:
 
     s = Sessions.load(name)
     print(f"  node={s['NODE']} port={s['PORT']}")
+    # The port was picked before submit, possibly hours ago — something else may
+    # have taken it while we waited. Move rather than fail with the job running.
+    if port_in_use(lport):
+        moved = pick_free_port(base_port, reserved=reserved_local_ports(exclude_name=name))
+        print(f"  local port {lport} was taken while the job started; using {moved}")
+        lport = moved
+        s["LOCAL_PORT"] = str(lport)
+        Sessions.save(name, s)
+        s = Sessions.load(name)
     spec = f"{lport}:{s['NODE']}:{s['PORT']}"
     print(f"Opening tunnel localhost:{lport} -> {s['NODE']}:{s['PORT']} via {cfg.host}...")
-    ssh.forward(spec)
+    forward_or_die(ssh, spec, lport,
+                   f"the job is running — reconnect with "
+                   f"'bouchet-jupyter tunnel up --name {name} --port NEW'",
+                   session=name)
     atomic_write_text(Sessions.tunnel_path(name), spec + "\n")
 
     url = f"http://localhost:{lport}/lab?token={s['TOKEN']}"
@@ -1165,14 +1310,17 @@ def cmd_up(args, cfg: Config) -> None:
             break
 
 
-def down_one(name: str, ssh: SSH, cfg: Config) -> None:
-    s = Sessions.load(name)
+def down_one(name: str, ssh: SSH, cfg: Config, payload: dict) -> None:
+    """Tear a session down. `payload` must come from a sync, not a bare
+    Sessions.load(): a session that lives only on the cluster has no local file,
+    and its JOB_ID would be invisible here."""
+    s = payload
     close_session_forwards(name, ssh, s)
     Sessions.session_path(name).unlink(missing_ok=True)
     if s.get("JOB_ID"):
         Slurm(ssh).cancel(s["JOB_ID"])
         print(f"[{name}] scancelled {s['JOB_ID']}")
-    remove_remote_session_file(name, ssh, cfg)
+    remove_all_remote_session_files(name, ssh, cfg)
     print(f"[{name}] tunnel down")
 
 
@@ -1181,15 +1329,16 @@ def cmd_down(args, cfg: Config) -> None:
     slurm = Slurm(ssh)
     if args.all:
         views = sync_all(ssh, slurm, cfg)
-        for v in views.values():
-            for line in v.notes:
-                print(line, file=sys.stderr)
-        names = Sessions.list_names()
-        if not names:
+        print_all_notes(views)
+        # Iterate what the sync returned, not Sessions.list_names(): a session
+        # that exists only on the cluster has no local file to enumerate, and
+        # the ones already autocleaned above come back with an empty payload.
+        targets = {n: v for n, v in views.items() if v.payload}
+        if not targets:
             print("(no tracked sessions)")
             return
-        for n in names:
-            down_one(n, ssh, cfg)
+        for n in sorted(targets):
+            down_one(n, ssh, cfg, targets[n].payload)
         return
     name = validate_name(args.name or "default")
     view = sync_one(name, ssh, slurm, cfg, max_age_s=0)
@@ -1201,7 +1350,7 @@ def cmd_down(args, cfg: Config) -> None:
         return
     if view.status == "unknown":
         die("could not reach the cluster — check ssh connectivity")
-    down_one(name, ssh, cfg)
+    down_one(name, ssh, cfg, view.payload)
 
 
 def print_list_rows(views: dict[str, SessionView]) -> None:
@@ -1295,10 +1444,14 @@ def cmd_url(args, cfg: Config) -> None:
     if not lport:
         die(f"session '{name}' has no LOCAL_PORT recorded; "
             f"run 'bouchet-jupyter tunnel up --name {name}' first")
+    # Compare the whole spec, not just the local port: a session that moved to a
+    # new node keeps its port, and a tunnel to the old node would look fine here
+    # while pointing nowhere.
     spec = read_tunnel_spec(name)
-    if not spec or spec.split(":", 1)[0] != lport:
-        die(f"session '{name}': no live tunnel on port {lport} "
-            f"(tunnel.spec {'missing' if not spec else 'has '+spec}); "
+    want = f"{lport}:{s.get('NODE','')}:{s.get('PORT','')}"
+    if spec != want:
+        die(f"session '{name}': no live tunnel to {s.get('NODE','?')}:{s.get('PORT','?')} "
+            f"on port {lport} (tunnel.spec {'missing' if not spec else 'has ' + spec}); "
             f"run 'bouchet-jupyter tunnel up --name {name}'")
     print(f"http://localhost:{lport}/lab?token={s['TOKEN']}")
 
@@ -1415,7 +1568,10 @@ def cmd_adopt(args, cfg: Config) -> None:
             print(f"[{v.name}] adopted, tunnel localhost:{s['LOCAL_PORT']} -> "
                   f"{s['NODE']}:{s['PORT']}")
         except SSHError as e:
-            print(f"[{v.name}] adopted, but tunnel failed: {e}", file=sys.stderr)
+            reason = forward_failure_reason(
+                ssh.host, int(s["LOCAL_PORT"]), str(e),
+                f"retry with 'bouchet-jupyter tunnel up --name {v.name} --port NEW'")
+            print(f"[{v.name}] adopted, but tunnel failed: {reason}", file=sys.stderr)
     if adopted == 0:
         print("(nothing adopted)")
 
@@ -1537,13 +1693,18 @@ def cmd_forward_down(args, cfg: Config) -> None:
 
 
 def cmd_forward_list(args, cfg: Config) -> None:
-    names = [args.name] if args.name else Sessions.list_names()
+    # Sync first: NODE comes from the cluster, and printing a forward against a
+    # node the session no longer runs on is worse than one extra round trip.
+    ssh   = SSH(cfg.host)
+    views = sync_all(ssh, Slurm(ssh), cfg)
+    print_all_notes(views)
+    names = [args.name] if args.name else sorted(views)
     if not names:
         print("(no tracked sessions)")
         return
     any_printed = False
     for n in names:
-        s = Sessions.load(n)
+        s = views[n].payload if n in views else Sessions.load(n)
         forwards = parse_forwards(s.get("FORWARDS", ""))
         if not forwards:
             continue

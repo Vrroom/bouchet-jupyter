@@ -10,6 +10,7 @@ similar that's running inside the same job.
 - `bouchet-jupyter` — the laptop-side CLI (Python, no dependencies on 3.11+)
 - `jupyter_launch.sh` — the sbatch script that runs on the cluster
 - `config.example.toml` — copy to `~/.config/bouchet-jupyter/config.toml`
+- `tests/` — session-state tests against a fake cluster (`python3 -m pytest tests`)
 
 ## Install
 
@@ -133,3 +134,27 @@ touching the cluster. Not available on `url` — by design.
 - `~/.config/bouchet-jupyter/config.toml` — paths, profiles, env_cmd
 - `~/.local/state/bouchet-jupyter/` — local session and tunnel state
 - `~/.jupyter-cluster/` on bouchet — remote session payloads, `env.sh`
+
+### Cluster session files
+
+The launcher writes `~/.jupyter-cluster/session.<NAME>@<JOB_ID>` and deletes
+it on exit. The job id is part of the name so a file left behind by a job that
+died without running its trap (SIGKILL, node failure) can never be mistaken for
+the current job's — the laptop picks the file whose job it is tracking, or the
+one Slurm still lists, and sweeps the rest once their jobs leave the queue.
+`@` separates the job id because session names may contain `.` but never `@`.
+
+Files written before this convention (`session.<NAME>`, job id inside) are
+still read and cleaned up, so a session that is live across the upgrade keeps
+working.
+
+## Tests
+
+```
+python3 -m pytest tests
+```
+
+`tests/fakecluster.py` answers the shell snippets the CLI sends (session file
+listing, squeue, sacct, scancel, rm) from in-memory dicts, so the tests drive
+the real reconciliation code with no ssh and no cluster. Each case is a bug
+that shipped; the docstring says which.

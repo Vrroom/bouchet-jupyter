@@ -14,8 +14,12 @@
 # (written by the laptop side). If that file is missing, we fall back to
 # loading the JupyterLab module.
 #
-# Session file is per-session: name comes from $JC_SESSION (default "default")
-# exported by the launcher via `sbatch --export=ALL,JC_SESSION=$NAME`.
+# Session file is per-session AND per-job: "session.$JC_SESSION@$SLURM_JOB_ID".
+# The name comes from $JC_SESSION (default "default"), exported by the laptop
+# launcher via `sbatch --export=ALL,JC_SESSION=$NAME`. The job id in the
+# filename is what makes a leftover file unambiguous: a file written by a job
+# that has since died can never be mistaken for the current job's. "@" is used
+# as the separator because session names may contain dots but never "@".
 
 set -euo pipefail
 mkdir -p job_logs
@@ -34,10 +38,10 @@ NODE=$(hostname -f)
 
 SESSION_DIR="$HOME/.jupyter-cluster"
 SESSION_NAME="${JC_SESSION:-default}"
-SESSION_FILE="$SESSION_DIR/session.$SESSION_NAME"
+SESSION_FILE="$SESSION_DIR/session.$SESSION_NAME@$SLURM_JOB_ID"
 mkdir -p "$SESSION_DIR"
 
-TMP=$(mktemp "$SESSION_DIR/session.$SESSION_NAME.XXXXXX")
+TMP=$(mktemp "$SESSION_DIR/.session.$SESSION_NAME.XXXXXX")
 cat > "$TMP" <<EOF
 NODE=$NODE
 PORT=$PORT
@@ -48,7 +52,8 @@ mv "$TMP" "$SESSION_FILE"
 
 # Cleanup must run on normal exit AND on the signals Slurm uses to end a job
 # (TERM on scancel / time limit; HUP on node drain). SIGKILL still bypasses
-# this — that case is handled by the laptop clearing this file before submit.
+# this — the laptop then clears the file once sacct confirms this job ended,
+# and until then the job id in the name keeps it from shadowing a newer job.
 # Also: do NOT `exec jupyter` below — exec replaces this shell, removing the
 # trap entirely, which is why prior runs orphaned the session file on every
 # normal completion.

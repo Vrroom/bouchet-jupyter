@@ -79,8 +79,14 @@ bouchet-jupyter url                      # print http://localhost:.../lab?token=
 bouchet-jupyter logs                     # tail the slurm log
 
 bouchet-jupyter down                     # scancel + close tunnels
+bouchet-jupyter down --name foo
 bouchet-jupyter down --all
 ```
+
+Bare `down` means the `default` session when that is the only one tracked.
+With several sessions up it lists them and asks which to tear down, since
+guessing would scancel the wrong job. Non-interactive runs (pipes, scripts)
+never prompt: there `down` still means `default`, so pass `--name` or `--all`.
 
 After a laptop reboot or network drop:
 

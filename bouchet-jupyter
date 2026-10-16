@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -43,8 +43,9 @@ def toml_load(path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 BUILTIN_PROFILES: dict[str, dict] = {
-    "gpu": {"partition": "gpu_h200", "gpus": "h200:1", "cpus": 8, "mem": "64G", "time": "08:00:00"},
-    "cpu": {"partition": "day",      "gpus": "",       "cpus": 8, "mem": "32G", "time": "08:00:00"},
+    "gpu":    {"partition": "gpu_h200", "gpus": "h200:1", "cpus": 8, "mem": "64G",  "time": "08:00:00"},
+    "cpu":    {"partition": "day",      "gpus": "",       "cpus": 8, "mem": "32G",  "time": "08:00:00"},
+    "bigmem": {"partition": "bigmem",   "gpus": "",       "cpus": 8, "mem": "256G", "time": "16:00:00"},
 }
 
 DEFAULTS = {
@@ -289,11 +290,25 @@ class Slurm:
                f"cd {sbatch_dir} && "
                f"sbatch --parsable --export=ALL,JC_SESSION={shlex.quote(session_name)} "
                f"{flags} {shlex.quote(sbatch_file)} | tee {marker}")
-        out = self.ssh.run(cmd, timeout=30)
+        # Read the marker first so a failed submit can be told apart from one
+        # whose reply we lost: the command clears the marker before sbatch runs,
+        # so a *changed* value means the job really was queued.
+        before = self.ssh.run(f"cat {marker} 2>/dev/null", check=False).strip()
+        try:
+            # retry=False: sbatch is not idempotent. SSH.run retries transient
+            # failures and timeouts, and a reply lost after sbatch already ran
+            # would submit a second job — one of which nobody is tracking, left
+            # to burn its whole walltime on a GPU.
+            out = self.ssh.run(cmd, timeout=30, retry=False)
+        except SSHError:
+            queued = self.ssh.run(f"cat {marker} 2>/dev/null", check=False).strip()
+            if queued.isdigit() and queued != before:
+                return queued
+            raise
         job_id = (out.strip().splitlines() or [""])[-1].strip()
         if not job_id.isdigit():
             recovered = self.ssh.run(f"cat {marker} 2>/dev/null", check=False).strip()
-            if recovered.isdigit():
+            if recovered.isdigit() and recovered != before:
                 job_id = recovered
         if not job_id.isdigit():
             raise SSHError(f"could not parse JOB_ID (stdout={out!r})")
@@ -473,8 +488,53 @@ def validate_name(name: str) -> str:
     return name
 
 
+def is_interactive() -> bool:
+    """Is there a human on the other end to answer a question? Piped, cron'd
+    and captured runs must not block on input, so callers fall back to their
+    non-interactive default when this is False."""
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):      # stdio closed or replaced
+        return False
+
+
+def prompt_for_choice(question: str, rows: list[tuple[str, str]]) -> str | None:
+    """Numbered menu over (value, label) rows. Returns the chosen value, or
+    None if the user cancelled. Typing the value itself also works, so the
+    answer someone already knows ("gpu-big") does not need a lookup.
+
+    Only call this behind is_interactive(): with no tty nobody can answer and
+    the read would hang."""
+    print(question)
+    for i, (_, label) in enumerate(rows, 1):
+        print(f"  {i}) {label}")
+    choices = {str(i): value for i, (value, _) in enumerate(rows, 1)}
+    choices.update({value: value for value, _ in rows})
+    while True:
+        try:
+            answer = input(f"choose 1-{len(rows)} (q to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if answer in choices:
+            return choices[answer]
+        if answer in ("", "q", "Q"):
+            return None
+        print(f"not one of the choices: {answer!r}")
+
+
 def port_in_use(p: int) -> bool:
+    """Would ssh fail to bind this local port?
+
+    SO_REUSEADDR is set because ssh sets it on its -L listeners, and without it
+    this answers a stricter question than the one we care about: connections
+    left in TIME_WAIT by a tunnel we *just* closed make a plain bind fail for a
+    minute. That is exactly the state `up` is in right after cleaning up the
+    previous session — the port it wants looks taken by its own dead tunnel, and
+    the session silently lands on the next port. A socket that is actually
+    LISTENing still conflicts, whether it bound the wildcard or loopback."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("127.0.0.1", p))
             return False
@@ -506,15 +566,20 @@ def pick_free_port(base: int, span: int = 50, *,
     die(f"no free local port in [{base},{base + span - 1}]")
 
 
-def reserved_local_ports(exclude_name: str | None = None) -> set[int]:
+def reserved_local_ports(exclude_name: str | None = None, *,
+                         names: list[str] | None = None) -> set[int]:
     """LOCAL_PORTs already assigned to other tracked sessions.
 
     Cache-only — does not ssh. We treat any tracked session's port as taken
     even if its tunnel happens to be down right now, because that session
     will try to re-open on the same port (e.g. via `tunnel up` or `adopt`).
+
+    `names` restricts that to sessions the caller has confirmed still exist.
+    Without it every local file counts, including one left behind by a job that
+    ended, whose port nothing is listening on any more.
     """
     out: set[int] = set()
-    for n in Sessions.list_names():
+    for n in (Sessions.list_names() if names is None else names):
         if n == exclude_name:
             continue
         try:
@@ -625,15 +690,17 @@ def record_forward(name: str, lport: int, rport: int) -> None:
     Sessions.save(name, s)
 
 
-def tracked_forward_owner(lport: int, *, exclude_tunnel_of: str | None = None
-                          ) -> tuple[str, str]:
+def tracked_forward_owner(lport: int, *, exclude_tunnel_of: str | None = None,
+                          names: list[str] | None = None) -> tuple[str, str]:
     """Which of our own sessions claims local port `lport`.
 
     Returns (description, command-that-frees-it); the command is empty when
     there is no targeted way to release it. `exclude_tunnel_of` skips one
     session's primary tunnel so `tunnel up` doesn't report a session as
-    colliding with itself while re-opening its own port."""
-    for n in Sessions.list_names():
+    colliding with itself while re-opening its own port. `names` means the same
+    thing it does in reserved_local_ports: only these sessions still exist, so
+    a file left by an ended job cannot be blamed for holding the port."""
+    for n in (Sessions.list_names() if names is None else names):
         s = Sessions.load(n)
         for l, r in parse_forwards(s.get("FORWARDS", "")):
             if l == lport:
@@ -668,10 +735,23 @@ def parse_iso(s: str) -> datetime | None:
         return None
 
 
-def fmt_eta(start: str) -> str:
+def cluster_utc_offset(ssh: SSH) -> timezone | None:
+    """The cluster's UTC offset. squeue prints start times in the cluster's
+    local time with no offset attached, and this laptop may not be in the same
+    timezone — comparing the two against our own clock is only right by luck."""
+    out = ssh.run("date +%z", check=False).strip()
+    if len(out) == 5 and out[0] in "+-" and out[1:].isdigit():
+        sign = 1 if out[0] == "+" else -1
+        return timezone(sign * timedelta(hours=int(out[1:3]), minutes=int(out[3:5])))
+    return None
+
+
+def fmt_eta(start: str, tz: timezone | None = None) -> str:
     dt = parse_iso(start)
     if not dt:
         return "-"
+    if dt.tzinfo is None and tz is not None:
+        dt = dt.replace(tzinfo=tz)
     now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
     delta = (dt - now).total_seconds()
     if delta < 0:
@@ -686,7 +766,8 @@ def fmt_eta(start: str) -> str:
 
 
 def forward_failure_reason(host: str, port: int, err: str, port_busy_hint: str,
-                           exclude_tunnel_of: str | None = None) -> str:
+                           exclude_tunnel_of: str | None = None,
+                           names: list[str] | None = None) -> str:
     """Explain why `ssh -O forward` refused, since ssh itself won't say.
 
     The mux client hands the request to the ControlMaster, and the master keeps
@@ -699,7 +780,8 @@ def forward_failure_reason(host: str, port: int, err: str, port_busy_hint: str,
         return (f"local port {port} is privileged (below 1024); ssh cannot bind it "
                 f"as this user, so {port_busy_hint}")
     if port_in_use(port):
-        who, how_to_free = tracked_forward_owner(port, exclude_tunnel_of=exclude_tunnel_of)
+        who, how_to_free = tracked_forward_owner(port, exclude_tunnel_of=exclude_tunnel_of,
+                                                 names=names)
         if not who:
             who = listener_description(port) or "another process"
         fix = f"close it with '{how_to_free}', or {port_busy_hint}" if how_to_free \
@@ -712,13 +794,14 @@ def forward_failure_reason(host: str, port: int, err: str, port_busy_hint: str,
 
 
 def forward_or_die(ssh: SSH, spec: str, port: int, port_busy_hint: str, *,
-                   session: str | None = None) -> None:
+                   session: str | None = None,
+                   names: list[str] | None = None) -> None:
     """Open an SSH port forward, or die explaining what actually went wrong."""
     try:
         ssh.forward(spec)
     except SSHError as e:
         die(f"forward failed: "
-            f"{forward_failure_reason(ssh.host, port, str(e), port_busy_hint, session)}")
+            f"{forward_failure_reason(ssh.host, port, str(e), port_busy_hint, session, names)}")
 
 
 def close_session_forwards(name: str, ssh: SSH, payload: dict) -> None:
@@ -773,6 +856,13 @@ def hours_to_walltime(hours: float) -> str:
     return f"{minutes // 60:02d}:{minutes % 60:02d}:00"
 
 
+def gb_to_slurm_mem(gb: int) -> str:
+    """Convert a --mem value in gigabytes to the size string Slurm wants, e.g. 128 -> '128G'."""
+    if gb <= 0:
+        die(f"--mem must be positive (got {gb})")
+    return f"{gb}G"
+
+
 def build_sbatch_flags(profile: dict) -> list[str]:
     flags: list[str] = []
     for k, prefix in (("partition", "--partition="), ("gpus", "--gpus="),
@@ -784,10 +874,42 @@ def build_sbatch_flags(profile: dict) -> list[str]:
     return flags
 
 
-def resolve_name_for_read(arg_name: str | None) -> str:
+def live_session_names(ssh: SSH, slurm: Slurm, cfg: Config) -> list[str]:
+    """Sessions the cluster still knows about, with the local files of ended
+    jobs cleaned up along the way."""
+    views = sync_all(ssh, slurm, cfg)
+    print_all_notes(views)
+    return sorted(n for n, v in views.items() if v.payload)
+
+
+def port_holding_names(exclude_name: str | None, ssh: SSH, slurm: Slurm,
+                       cfg: Config) -> list[str]:
+    """Sessions whose local port bookkeeping still counts.
+
+    A local session file outlives its job, and until something cleans it up its
+    LOCAL_PORT and FORWARDS go on reserving a port nothing is listening on, so
+    the cluster decides who is real. Skipped when nothing else is on disk:
+    there is no other session to collide with, and `up` should not pay for a
+    round trip to learn that."""
+    names = Sessions.list_names()
+    if not any(n != exclude_name for n in names):
+        return names
+    return live_session_names(ssh, slurm, cfg)
+
+
+def resolve_name_for_read(arg_name: str | None, ssh: SSH, slurm: Slurm,
+                          cfg: Config) -> str:
+    """The session a command with no --name should act on.
+
+    A local session file outlives its job: it sits there until some synced
+    command notices the job ended and cleans it up. Counting those files makes
+    one live session look ambiguous, so once there is more than one name the
+    cluster gets to say which of them still exist."""
     if arg_name:
         return validate_name(arg_name)
     names = Sessions.list_names()
+    if len(names) > 1:
+        names = live_session_names(ssh, slurm, cfg)
     if not names:
         die("no tracked sessions — run 'bouchet-jupyter up' to start one, or "
             "'bouchet-jupyter adopt' if a session is already running on the cluster")
@@ -986,8 +1108,13 @@ class ClusterSnapshot:
     @staticmethod
     def fetch(ssh: SSH, cfg: Config, name: str = "") -> "ClusterSnapshot":
         try:
+            # check=True matters: with check=False a failed ssh returns "", and
+            # an unreachable cluster becomes indistinguishable from one holding
+            # no session files and no jobs — every session then classifies as
+            # stale_unverified instead of unknown, and `down --all` would tear
+            # down local state while the jobs it "scancelled" kept running.
             out = ssh.run(cluster_probe_command(cfg.state_remote_dir, name),
-                          check=False, retry=True)
+                          check=True, retry=True)
         except SSHError:
             return ClusterSnapshot(ok=False)
         files_block, _, squeue_block = out.partition("==SQUEUE==")
@@ -1206,6 +1333,28 @@ def status_message(view: SessionView) -> str:
     return f"could not reach the cluster to verify '{n}'; using cached state"
 
 
+def state_token(view: SessionView) -> str:
+    """One display token combining the squeue state with our own status."""
+    if view.status == "live":
+        return view.job_state or "RUNNING"
+    if view.status == "launching":
+        return view.job_state or "LAUNCHING"
+    if view.status == "winding_down":
+        return view.job_state or "COMPLETING"
+    return view.status.upper()
+
+
+def session_menu_label(view: SessionView) -> str:
+    """One-line description of a session for a chooser: enough to tell two
+    sessions apart without running `list` first."""
+    s = view.payload
+    node = s.get("NODE") or view.extras.get("node", "-")
+    elapsed = view.extras.get("elapsed", "-")
+    limit   = view.extras.get("limit", "-")
+    return (f"{view.name:<12} job {s.get('JOB_ID', '?'):<10} "
+            f"{state_token(view):<14} {node:<14} {elapsed}/{limit}")
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -1238,8 +1387,19 @@ def cmd_up(args, cfg: Config) -> None:
     resolved  = cfg.resolve_profile(profile)
     if args.hours is not None:
         resolved["time"] = hours_to_walltime(args.hours)
+    if args.mem is not None:
+        resolved["mem"] = gb_to_slurm_mem(args.mem)
     base_port = args.port or cfg.local_port
-    lport     = pick_free_port(base_port, reserved=reserved_local_ports(exclude_name=name))
+    live      = port_holding_names(name, ssh, slurm, cfg)
+    lport     = pick_free_port(base_port,
+                               reserved=reserved_local_ports(exclude_name=name, names=live))
+    if lport != base_port:
+        # Landing on a different port than usual changes the URL and breaks
+        # bookmarks, so never do it silently — say who has the one we wanted.
+        holder = (tracked_forward_owner(base_port, names=live)[0]
+                  or listener_description(base_port))
+        print(f"note: local port {base_port} is in use{f' by {holder}' if holder else ''}; "
+              f"using {lport}")
 
     print("Syncing env to cluster...")
     push_env_file(ssh, cfg.env_cmd, cfg.state_remote_dir)
@@ -1286,7 +1446,11 @@ def cmd_up(args, cfg: Config) -> None:
     # The port was picked before submit, possibly hours ago — something else may
     # have taken it while we waited. Move rather than fail with the job running.
     if port_in_use(lport):
-        moved = pick_free_port(base_port, reserved=reserved_local_ports(exclude_name=name))
+        # `live` was read before the submit, possibly hours ago — ask again
+        # rather than reserve ports for sessions that ended in the meantime.
+        live  = port_holding_names(name, ssh, slurm, cfg)
+        moved = pick_free_port(base_port,
+                               reserved=reserved_local_ports(exclude_name=name, names=live))
         print(f"  local port {lport} was taken while the job started; using {moved}")
         lport = moved
         s["LOCAL_PORT"] = str(lport)
@@ -1297,7 +1461,7 @@ def cmd_up(args, cfg: Config) -> None:
     forward_or_die(ssh, spec, lport,
                    f"the job is running — reconnect with "
                    f"'bouchet-jupyter tunnel up --name {name} --port NEW'",
-                   session=name)
+                   session=name, names=live)
     atomic_write_text(Sessions.tunnel_path(name), spec + "\n")
 
     url = f"http://localhost:{lport}/lab?token={s['TOKEN']}"
@@ -1324,19 +1488,45 @@ def down_one(name: str, ssh: SSH, cfg: Config, payload: dict) -> None:
     print(f"[{name}] tunnel down")
 
 
+def down_targets(ssh: SSH, slurm: Slurm, cfg: Config) -> dict[str, SessionView]:
+    """Every session that still has something to tear down, freshly synced."""
+    views = sync_all(ssh, slurm, cfg)
+    print_all_notes(views)
+    # Same guard the single-session path has: tearing down against a cluster we
+    # cannot reach deletes local state and prints "scancelled" for jobs that are
+    # still running, because scancel fails silently.
+    if any(v.status == "unknown" for v in views.values()):
+        die("could not reach the cluster — check ssh connectivity")
+    # Return what the sync produced, not Sessions.list_names(): a session that
+    # exists only on the cluster has no local file to enumerate, and the ones
+    # already autocleaned above come back with an empty payload.
+    return {n: v for n, v in views.items() if v.payload}
+
+
 def cmd_down(args, cfg: Config) -> None:
     ssh   = SSH(cfg.host)
     slurm = Slurm(ssh)
-    if args.all:
-        views = sync_all(ssh, slurm, cfg)
-        print_all_notes(views)
-        # Iterate what the sync returned, not Sessions.list_names(): a session
-        # that exists only on the cluster has no local file to enumerate, and
-        # the ones already autocleaned above come back with an empty payload.
-        targets = {n: v for n, v in views.items() if v.payload}
+    # Bare `down` with several sessions tracked: 'default' would be a guess, and
+    # guessing wrong scancels the wrong job — ask which one instead. The local
+    # name count is checked first so the ordinary one-session case still takes
+    # the cheaper single-session path below.
+    ask = (args.name is None and not args.all
+           and len(Sessions.list_names()) > 1 and is_interactive())
+    if args.all or ask:
+        targets = down_targets(ssh, slurm, cfg)
         if not targets:
             print("(no tracked sessions)")
             return
+        # len > 1 is re-checked against the synced set, not the local file
+        # count: files left by ended jobs are cleaned above, and there is
+        # nothing to ask about once one session is left.
+        if ask and len(targets) > 1:
+            rows = [(n, session_menu_label(targets[n])) for n in sorted(targets)]
+            chosen = prompt_for_choice("which session do you want to tear down?", rows)
+            if chosen is None:
+                print("cancelled — nothing torn down")
+                return
+            targets = {chosen: targets[chosen]}
         for n in sorted(targets):
             down_one(n, ssh, cfg, targets[n].payload)
         return
@@ -1376,15 +1566,7 @@ def print_list_rows(views: dict[str, SessionView]) -> None:
         node = s.get("NODE") or v.extras.get("node", "-")
         elapsed = v.extras.get("elapsed", "-")
         limit   = v.extras.get("limit", "-")
-        # Display a single STATE token combining squeue state + our status.
-        if v.status == "live":
-            state = v.job_state or "RUNNING"
-        elif v.status == "launching":
-            state = v.job_state or "LAUNCHING"
-        elif v.status == "winding_down":
-            state = v.job_state or "COMPLETING"
-        else:
-            state = v.status.upper()
+        state = state_token(v)
         print(f"{v.name:<12} {s.get('PROFILE','?'):<7} {jid:<10} {state:<14} "
               f"{node:<14} {s.get('LOCAL_PORT','?'):<6} {s.get('PORT','-'):<6} "
               f"{elapsed}/{limit}")
@@ -1433,8 +1615,8 @@ def cmd_status(args, cfg: Config) -> None:
 
 
 def cmd_url(args, cfg: Config) -> None:
-    name = resolve_name_for_read(args.name)
     ssh  = SSH(cfg.host)
+    name = resolve_name_for_read(args.name, ssh, Slurm(ssh), cfg)
     view = sync_one(name, ssh, Slurm(ssh), cfg, max_age_s=DEFAULT_FRESH_S)
     require_live(view)
     if not view.payload.get("TOKEN"):
@@ -1457,9 +1639,9 @@ def cmd_url(args, cfg: Config) -> None:
 
 
 def cmd_logs(args, cfg: Config) -> None:
-    name  = resolve_name_for_read(args.name)
     ssh   = SSH(cfg.host)
     slurm = Slurm(ssh)
+    name  = resolve_name_for_read(args.name, ssh, slurm, cfg)
     view  = sync_one(name, ssh, slurm, cfg, max_age_s=30)
     print_notes(view)
     jid = view.payload.get("JOB_ID")
@@ -1508,7 +1690,7 @@ state_remote_dir = "{DEFAULTS['state_remote_dir']}"
 default_profile = "{DEFAULTS['default_profile']}"
 env_cmd = "module load JupyterLab/4.2.5-GCCcore-13.3.0"
 
-# Built-in profiles (gpu, cpu) are baked in. Override per-key with
+# Built-in profiles (gpu, cpu, bigmem) are baked in. Override per-key with
 # [profiles.<name>] tables; add new profiles the same way.
 # [profiles.gpu]
 # time = "04:00:00"
@@ -1581,21 +1763,22 @@ def cmd_adopt(args, cfg: Config) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_tunnel_up(args, cfg: Config) -> None:
-    name  = resolve_name_for_read(args.name)
     ssh   = SSH(cfg.host)
     slurm = Slurm(ssh)
+    name  = resolve_name_for_read(args.name, ssh, slurm, cfg)
     view  = sync_one(name, ssh, slurm, cfg, max_age_s=0)
     require_live(view)
     s = view.payload
+    live = port_holding_names(name, ssh, slurm, cfg)
     if not s.get("LOCAL_PORT"):
         s["LOCAL_PORT"] = str(pick_free_port(
-            cfg.local_port, reserved=reserved_local_ports(exclude_name=name)))
+            cfg.local_port, reserved=reserved_local_ports(exclude_name=name, names=live)))
         Sessions.save(name, s)
         s = Sessions.load(name)
 
     if args.port is not None:
         lport = args.port
-        if lport in reserved_local_ports(exclude_name=name):
+        if lport in reserved_local_ports(exclude_name=name, names=live):
             die(f"port {lport} is already assigned to another tracked session; "
                 f"pass a different --port or 'down' the other one first")
     else:
@@ -1609,7 +1792,7 @@ def cmd_tunnel_up(args, cfg: Config) -> None:
         ssh.cancel_forward(old_spec)
 
     forward_or_die(ssh, spec, lport, "pass --port NEW to pick a different one",
-                   session=name)
+                   session=name, names=live)
     atomic_write_text(Sessions.tunnel_path(name), spec + "\n")
     if str(lport) != s.get("LOCAL_PORT"):
         s["LOCAL_PORT"] = str(lport)
@@ -1636,9 +1819,9 @@ def cmd_forward_up(args, cfg: Config) -> None:
             die(f"local port {lport} given more than once")
         seen.add(lport)
 
-    name  = resolve_name_for_read(args.name)
     ssh   = SSH(cfg.host)
     slurm = Slurm(ssh)
+    name  = resolve_name_for_read(args.name, ssh, slurm, cfg)
     view  = sync_one(name, ssh, slurm, cfg, max_age_s=DEFAULT_FRESH_S)
     require_live(view)
     s = view.payload
@@ -1657,9 +1840,9 @@ def cmd_forward_up(args, cfg: Config) -> None:
 
 
 def cmd_forward_down(args, cfg: Config) -> None:
-    name  = resolve_name_for_read(args.name)
     ssh   = SSH(cfg.host)
     slurm = Slurm(ssh)
+    name  = resolve_name_for_read(args.name, ssh, slurm, cfg)
     view  = sync_one(name, ssh, slurm, cfg, max_age_s=DEFAULT_FRESH_S)
     print_notes(view)
     if view.status == "missing":
@@ -1819,6 +2002,7 @@ def cmd_inspect_wait(args, cfg: Config) -> None:
         by_part.setdefault(part, []).append(prio)
         me_lookup[jid_p] = (prio, part)
 
+    tz = cluster_utc_offset(ssh)   # squeue's start times are in cluster-local time
     print(f"{'NAME':<10} {'JOB_ID':<10} {'PARTITION':<12} {'PRIO':<6} "
           f"{'POS':<8} {'REASON':<14} {'START_ESTIMATE':<22} ETA")
     for sname, jid in targets:
@@ -1834,7 +2018,7 @@ def cmd_inspect_wait(args, cfg: Config) -> None:
             print(f"{sname:<10} {jid:<10} {'?':<12} {'?':<6} "
                   f"{pos:<8} {'?':<14} {'(no estimate)':<22} -")
             continue
-        eta = fmt_eta(est["start"]) if est["start"] != "N/A" else "-"
+        eta = fmt_eta(est["start"], tz) if est["start"] != "N/A" else "-"
         print(f"{sname:<10} {jid:<10} {est['partition']:<12} {est['priority']:<6} "
               f"{pos:<8} {est['reason']:<14} {est['start']:<22} {eta}")
 
@@ -1854,16 +2038,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("up", help="submit a job, wait for it, open tunnel + browser",
                         description="Submit a Jupyter job, wait until it lands, "
                                     "open an SSH tunnel and the browser URL.")
-    sp.add_argument("--profile", help=f"profile name (default: from config, e.g. gpu/cpu)")
+    sp.add_argument("--profile", help=f"profile name (default: from config, e.g. gpu/cpu/bigmem)")
     sp.add_argument("--name", help="session name (default: 'default')")
     sp.add_argument("--port", type=int, help="local port base (auto-bumped if busy)")
     sp.add_argument("--hours", type=float,
                     help="walltime in hours, overrides the profile's time (e.g. --hours 10)")
+    sp.add_argument("--mem", type=int,
+                    help="memory in GB, overrides the profile's mem (e.g. --mem 128)")
     sp.set_defaults(fn=cmd_up)
 
     sp = sub.add_parser("down", help="tear down a session (or all)",
                         description="Cancel the Slurm job and close its tunnel.")
-    sp.add_argument("--name", help="session name (default: 'default')")
+    sp.add_argument("--name", help="session name (default: 'default'; with several "
+                                   "tracked, asks which one)")
     sp.add_argument("--all", action="store_true", help="tear down every tracked session")
     sp.set_defaults(fn=cmd_down)
 

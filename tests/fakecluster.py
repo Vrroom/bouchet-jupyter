@@ -65,6 +65,11 @@ class FakeSSH:
     def run(self, cmd, *, check=True, timeout=None, input_data=None, retry=True):
         self.commands.append(cmd)
         if self.fail:
+            # Faithful to the real SSH.run: it only raises when `check` is set.
+            # With check=False a failure comes back as an empty string, which
+            # reads exactly like "the cluster has nothing to report".
+            if not check:
+                return ""
             raise self.SSHError("ssh: connection refused")
         out: list[str] = []
         for part in cmd.split(" ; "):

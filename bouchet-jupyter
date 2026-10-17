@@ -11,6 +11,7 @@ import argparse
 import os
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -820,6 +821,8 @@ def close_session_forwards(name: str, ssh: SSH, payload: dict) -> None:
                 ssh.cancel_forward(f"{lport}:{node}:{rport}")
             except Exception:
                 pass
+        for lport, rport, pid in parse_reverse_forwards(payload.get("REVERSE_FORWARDS", "")):
+            stop_reverse_forward(pid, node, lport, rport)
 
 
 def remove_remote_session_files(name: str, ssh: SSH, cfg: Config,
@@ -916,6 +919,174 @@ def resolve_name_for_read(arg_name: str | None, ssh: SSH, slurm: Slurm,
     if len(names) == 1:
         return names[0]
     die("multiple sessions tracked — pass --name <NAME>:\n  " + "\n  ".join(names))
+
+
+# ---------------------------------------------------------------------------
+# Reverse forwards (a process on the node reaching a server on this machine)
+# ---------------------------------------------------------------------------
+# The login node's sshd binds `-R` listeners on loopback only, so a listener
+# the node can reach has to live on the node itself. Each reverse forward is
+# therefore its own `ssh -N -J <host> <user>@NODE -R REMOTE:localhost:LOCAL`
+# process, started detached so it outlives the CLI, and tracked in session
+# state as REVERSE_FORWARDS=LOCAL:REMOTE:PID,... keyed by the node port.
+
+REVERSE_CONFIRM_S = 20   # how long `forward up --reverse` waits for the node-side listener
+REVERSE_STOP_S    = 5    # how long `forward down` waits for the ssh process to exit
+
+
+def parse_reverse_forwards(s: str) -> list[tuple[int, int, int]]:
+    """Parse 'LOCAL:REMOTE:PID,...' into (lport, rport, pid) triples."""
+    out: list[tuple[int, int, int]] = []
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        parts = tok.split(":")
+        assert len(parts) == 3, \
+            f"(parse_reverse_forwards): expected LOCAL:REMOTE:PID, got {tok!r}"
+        out.append((int(parts[0]), int(parts[1]), int(parts[2])))
+    return out
+
+
+def format_reverse_forwards(items: list[tuple[int, int, int]]) -> str:
+    """Inverse of parse_reverse_forwards."""
+    return ",".join(f"{l}:{r}:{p}" for l, r, p in items)
+
+
+def record_reverse_forward(name: str, lport: int, rport: int, pid: int) -> None:
+    """Track a reverse forward in session state, replacing any prior entry on rport."""
+    s = Sessions.load(name)
+    items = [t for t in parse_reverse_forwards(s.get("REVERSE_FORWARDS", "")) if t[1] != rport]
+    items.append((lport, rport, pid))
+    s["REVERSE_FORWARDS"] = format_reverse_forwards(items)
+    Sessions.save(name, s)
+
+
+def ssh_user_for(host: str) -> str:
+    """The user ssh would log in as for `host`, read from `ssh -G` (ssh's own
+    resolved config). A compute node's hostname matches no Host block, so the
+    user has to be passed explicitly when jumping to it."""
+    r = subprocess.run(["ssh", "-G", host], capture_output=True, text=True, timeout=SSH_TIMEOUT)
+    assert r.returncode == 0, f"(ssh_user_for): ssh -G {host} failed: {r.stderr.strip()}"
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition(" ")
+        if k == "user":
+            return v
+    raise AssertionError(f"(ssh_user_for): ssh -G {host} printed no 'user' line")
+
+
+def node_ssh_argv(host: str, user: str, node: str, options: list[str] = []) -> list[str]:
+    """ssh argv for one hop through `host` into `node`, options before the
+    destination. BatchMode so nothing can prompt a detached process;
+    accept-new so a node's host key is recorded on first contact into
+    ~/.ssh/known_hosts and verified from then on."""
+    return ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+            *options, "-J", host, f"{user}@{node}"]
+
+
+def reverse_forward_argv(host: str, user: str, node: str, lport: int, rport: int) -> list[str]:
+    """The long-lived process. -N holds the connection open with no command;
+    ExitOnForwardFailure makes a refused -R bind exit instead of lingering as
+    a connection that forwards nothing."""
+    return node_ssh_argv(host, user, node, [
+        "-N", "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=60", "-o", "ServerAliveCountMax=3",
+        "-R", f"{rport}:localhost:{lport}"])
+
+
+def reverse_forward_log_path(name: str, rport: int) -> Path:
+    """Where the reverse forward's ssh keeps its stderr, for diagnosis."""
+    return STATE_DIR / f"reverse.{name}.{rport}.log"
+
+
+def start_reverse_forward(argv: list[str], log: Path) -> subprocess.Popen:
+    """Start the ssh detached from this CLI invocation: its own session so a
+    Ctrl-C here never reaches it, stdin closed, output kept in `log`."""
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "wb") as f:
+        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=f,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def node_listener(host: str, user: str, node: str, port: int) -> str:
+    """The `ss -ltn` line for `port` on the node ('' when nothing listens),
+    fetched through one short-lived ssh into the node."""
+    r = subprocess.run(node_ssh_argv(host, user, node) + [f"ss -ltnH 'sport = :{port}'"],
+                       capture_output=True, text=True, timeout=SSH_TIMEOUT * 2)
+    if r.returncode != 0:
+        raise SSHError(f"ssh into {node} failed: {(r.stderr or r.stdout).strip()}")
+    return r.stdout.strip()
+
+
+def reverse_forward_failure_reason(node: str, lport: int, rport: int, listener: str,
+                                   log: Path) -> str:
+    """Explain a reverse forward that died, since ssh only says 'remote port
+    forwarding failed': the node port being busy is the usual cause, and
+    `listener` (ss output from the node) shows it directly."""
+    said = log.read_text().strip() if log.exists() else ""
+    tail = f"\n  ssh said: {said}" if said else ""
+    if listener:
+        return (f"node port {rport} on {node} is already in use (ss: {listener}); pick another "
+                f"node port: 'bouchet-jupyter forward up --reverse {lport}:{rport + 1}'{tail}")
+    return f"the ssh into {node} exited and node port {rport} is free; its output is in {log}{tail}"
+
+
+def open_reverse_forward(host: str, node: str, lport: int, rport: int, log: Path) -> tuple[int, str]:
+    """Start a reverse forward and wait until the node-side listener exists.
+    Returns (pid, ss line); dies with the actual cause otherwise."""
+    user = ssh_user_for(host)
+    log.unlink(missing_ok=True)
+    busy = node_listener(host, user, node, rport)
+    if busy:
+        die(f"reverse forward failed: {reverse_forward_failure_reason(node, lport, rport, busy, log)}")
+    proc = start_reverse_forward(reverse_forward_argv(host, user, node, lport, rport), log)
+    deadline = time.monotonic() + REVERSE_CONFIRM_S
+    while True:
+        if proc.poll() is not None:
+            listener = node_listener(host, user, node, rport)
+            die(f"reverse forward failed (ssh exited {proc.returncode}): "
+                f"{reverse_forward_failure_reason(node, lport, rport, listener, log)}")
+        listener = node_listener(host, user, node, rport)
+        if listener:
+            return proc.pid, listener
+        if time.monotonic() > deadline:
+            proc.terminate()
+            die(f"reverse forward failed: no listener on {node}:{rport} after {REVERSE_CONFIRM_S}s "
+                f"although the ssh (pid {proc.pid}) was still running; killed it. "
+                f"Its output is in {log}")
+        time.sleep(1)
+
+
+def reverse_forward_cmdline(pid: int) -> list[str]:
+    """argv of process `pid` from /proc; [] when no such process exists."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except FileNotFoundError:
+        return []
+    return raw.decode(errors="replace").split("\0")[:-1]
+
+
+def is_reverse_forward_process(cmdline: list[str], node: str, lport: int, rport: int) -> bool:
+    """Does this argv look like the ssh we started for this exact forward?"""
+    return (bool(cmdline) and Path(cmdline[0]).name == "ssh"
+            and f"{rport}:localhost:{lport}" in cmdline
+            and any(a.endswith(f"@{node}") for a in cmdline))
+
+
+def stop_reverse_forward(pid: int, node: str, lport: int, rport: int) -> bool:
+    """SIGTERM the reverse forward's ssh at `pid`, but only if that pid still
+    runs our ssh for this forward: a pid is recycled once its process exits,
+    so an unchecked kill could hit an unrelated process. Returns whether a
+    kill was sent."""
+    if not is_reverse_forward_process(reverse_forward_cmdline(pid), node, lport, rport):
+        return False
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + REVERSE_STOP_S
+    while reverse_forward_cmdline(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if reverse_forward_cmdline(pid):
+        os.kill(pid, signal.SIGKILL)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1600,7 +1771,7 @@ def cmd_status(args, cfg: Config) -> None:
         die(f"no session named '{name}'")
     s = view.payload
     for k in ("JOB_ID", "PROFILE", "LOCAL_PORT", "NODE", "PORT", "TOKEN",
-              "FORWARDS", "SUBMITTED_AT", "SYNCED_AT"):
+              "FORWARDS", "REVERSE_FORWARDS", "SUBMITTED_AT", "SYNCED_AT"):
         if k in s:
             print(f"{k}={s[k]}")
     print()
@@ -1807,6 +1978,8 @@ def cmd_tunnel_up(args, cfg: Config) -> None:
 
 def cmd_forward_up(args, cfg: Config) -> None:
     pairs = [parse_port_spec(tok) for tok in args.ports]
+    if args.reverse and (len(pairs) != 1 or args.remote is not None):
+        die("--reverse takes exactly one LOCAL[:REMOTE] spec and no --remote")
     if args.remote is not None:
         if len(pairs) > 1:
             die("--remote works with a single PORT; use LOCAL:REMOTE pairs for multiple")
@@ -1828,6 +2001,18 @@ def cmd_forward_up(args, cfg: Config) -> None:
     node = args.node or s.get("NODE")
     if not node:
         die(f"session '{name}' has no NODE — pass --node, or wait for the job to start")
+    if args.reverse:
+        lport, rport = pairs[0]
+        if not port_in_use(lport):
+            print(f"note: nothing is listening on localhost:{lport} here yet", file=sys.stderr)
+        pid, listener = open_reverse_forward(cfg.host, node, lport, rport,
+                                             reverse_forward_log_path(name, rport))
+        record_reverse_forward(name, lport, rport, pid)
+        print(f"Reverse forward up: {node} localhost:{rport} -> localhost:{lport} here  "
+              f"(pid {pid}, session={name})")
+        print(f"  node-side listener: {listener}")
+        print(f"  dial from the node: localhost:{rport}")
+        return
     # Record after each successful forward so a failure partway through still
     # leaves the already-open ones tracked (and torn down later by `down`).
     for lport, rport in pairs:
@@ -1851,27 +2036,51 @@ def cmd_forward_down(args, cfg: Config) -> None:
     if not s:
         die(f"session '{name}' has no local state; nothing to tear down")
     forwards = parse_forwards(s.get("FORWARDS", ""))
+    reverse  = parse_reverse_forwards(s.get("REVERSE_FORWARDS", ""))
     by_lport = dict(forwards)
+    by_rport = {r: (l, pid) for l, r, pid in reverse}
     ports = list(dict.fromkeys(args.ports))
-    unknown = [p for p in ports if p not in by_lport]
+    if args.reverse:
+        unknown = [p for p in ports if p not in by_rport]
+    else:
+        unknown = [p for p in ports if p not in by_lport and p not in by_rport]
+        both = [p for p in ports if p in by_lport and p in by_rport]
+        if both:
+            die(f"port(s) {', '.join(str(p) for p in both)} name both a forward (local port) "
+                f"and a reverse forward (node port) for session '{name}'; pass --reverse "
+                f"to close the reverse one")
     if unknown:
-        die(f"no tracked forward on port(s) {', '.join(str(p) for p in unknown)} "
-            f"for session '{name}'")
+        die(f"no tracked {'reverse ' if args.reverse else ''}forward on port(s) "
+            f"{', '.join(str(p) for p in unknown)} for session '{name}'")
     node = s.get("NODE")
     if not node:
         die(f"session '{name}' has no NODE; cannot derive forward spec")
-    for lport in ports:
-        rport = by_lport[lport]
+    closed_reverse: set[int] = set()
+    for port in ports:
+        if args.reverse or port not in by_lport:
+            lport, pid = by_rport[port]
+            killed = stop_reverse_forward(pid, node, lport, port)
+            closed_reverse.add(port)
+            print(f"Reverse forward down: {node} localhost:{port} -> localhost:{lport}  "
+                  f"({'killed' if killed else 'already gone'}: pid {pid})")
+            continue
+        rport = by_lport[port]
         try:
-            ssh.cancel_forward(f"{lport}:{node}:{rport}")
+            ssh.cancel_forward(f"{port}:{node}:{rport}")
         except Exception:
             pass  # best-effort, matches close_session_forwards
-        print(f"Forward down: localhost:{lport} -> {node}:{rport}")
-    remaining = [(l, r) for l, r in forwards if l not in set(ports)]
+        print(f"Forward down: localhost:{port} -> {node}:{rport}")
+    closed_forward = set(ports) - closed_reverse
+    remaining = [(l, r) for l, r in forwards if l not in closed_forward]
     if remaining:
         s["FORWARDS"] = format_forwards(remaining)
     else:
         s.pop("FORWARDS", None)
+    remaining_reverse = [t for t in reverse if t[1] not in closed_reverse]
+    if remaining_reverse:
+        s["REVERSE_FORWARDS"] = format_reverse_forwards(remaining_reverse)
+    else:
+        s.pop("REVERSE_FORWARDS", None)
     Sessions.save(name, s)
 
 
@@ -1889,13 +2098,18 @@ def cmd_forward_list(args, cfg: Config) -> None:
     for n in names:
         s = views[n].payload if n in views else Sessions.load(n)
         forwards = parse_forwards(s.get("FORWARDS", ""))
-        if not forwards:
+        reverse  = parse_reverse_forwards(s.get("REVERSE_FORWARDS", ""))
+        if not forwards and not reverse:
             continue
         any_printed = True
         node = s.get("NODE", "?")
         print(f"[{n}] node={node}")
         for lport, rport in forwards:
             print(f"  localhost:{lport} -> {node}:{rport}")
+        for lport, rport, pid in reverse:
+            running = is_reverse_forward_process(reverse_forward_cmdline(pid), node, lport, rport)
+            print(f"  {node} localhost:{rport} -> localhost:{lport}  "
+                  f"(reverse, pid {pid} {'running' if running else 'not running'})")
     if not any_printed:
         print("(no extra forwards)")
 
@@ -2111,13 +2325,19 @@ def build_parser() -> argparse.ArgumentParser:
                      help="remote port on the node (single PORT only; default: same as local)")
     fsp.add_argument("--node", help="override target node (default: session's NODE)")
     fsp.add_argument("--name", help="session name (default: sole tracked session)")
+    fsp.add_argument("--reverse", action="store_true",
+                     help="reverse direction: the node's localhost:REMOTE reaches this machine's "
+                          "localhost:LOCAL (one spec; starts a dedicated ssh into the node)")
     fsp.set_defaults(fn=cmd_forward_up)
 
     fsp = fsub.add_parser("down", help="close tracked forwards",
                           description="Cancels the forward(s) and drops them from session state.")
     fsp.add_argument("ports", type=int, nargs="+", metavar="PORT",
-                     help="local port(s) of the forward(s) to close")
+                     help="local port(s) of forward(s), or node port(s) of reverse forward(s), to close")
     fsp.add_argument("--name", help="session name (default: sole tracked session)")
+    fsp.add_argument("--reverse", action="store_true",
+                     help="PORT names a reverse forward's node port (only needed when it coincides "
+                          "with a forward's local port)")
     fsp.set_defaults(fn=cmd_forward_down)
 
     fsp = fsub.add_parser("list", help="list extra forwards on tracked sessions",

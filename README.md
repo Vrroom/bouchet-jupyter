@@ -109,6 +109,26 @@ bouchet-jupyter forward down 8082 8083
 
 These are tracked in session state and torn down by `down`.
 
+A reverse forward goes the other way: a process inside the job reaches a
+server on this machine. The login node's sshd binds `-R` listeners on
+loopback only, so each reverse forward is its own
+`ssh -N -J <host> <user>@NODE -R REMOTE:localhost:LOCAL` process into the
+compute node (pam_slurm_adopt admits you while your job runs there), started
+detached and tracked by pid in session state:
+
+```
+bouchet-jupyter forward up --reverse 8765       # on NODE, localhost:8765 -> localhost:8765 here
+bouchet-jupyter forward up --reverse 8765:9000  # on NODE, localhost:9000 -> localhost:8765 here
+bouchet-jupyter forward list                    # direction, pid, and whether the ssh still runs
+bouchet-jupyter forward down 9000               # by the node port (--reverse if a forward's local port coincides)
+```
+
+On success the command prints the address to dial from the node. The node's
+host key is recorded in `~/.ssh/known_hosts` on first contact
+(`StrictHostKeyChecking=accept-new`). `forward down`, `down` and the
+stale-session cleanup kill the ssh only after checking that the pid still
+runs it, since pids are recycled.
+
 Cluster snapshots:
 
 ```

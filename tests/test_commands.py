@@ -114,7 +114,7 @@ def test_forward_up_records_only_what_it_opened():
     fc.FakeSSH.taken_ports = {9002}
 
     with pytest.raises(SystemExit):
-        cli.cmd_forward_up(Args(ports=["9001", "9002"], remote=None, node=None, name=None), cfg())
+        cli.cmd_forward_up(Args(ports=["9001", "9002"], remote=None, node=None, name=None, reverse=False), cfg())
 
     assert cli.parse_forwards(cli.Sessions.load("default")["FORWARDS"]) == [(9001, 9001)]
     assert ssh.forwards == [f"9001:{NODE}:9001"]
@@ -212,7 +212,7 @@ def test_forward_up_is_not_blocked_by_a_dead_session_file():
     ended made the one live session look ambiguous and the command refused."""
     ssh = live_plus_dead()
 
-    cli.cmd_forward_up(Args(ports=["8765"], remote=None, node=None, name=None), cfg())
+    cli.cmd_forward_up(Args(ports=["8765"], remote=None, node=None, name=None, reverse=False), cfg())
 
     assert ssh.forwards == [f"8765:{NODE}:8765"]
     assert cli.Sessions.list_names() == ["default"], "the dead file is cleaned"
@@ -222,7 +222,7 @@ def test_name_resolution_still_refuses_two_live_sessions():
     ssh = two_sessions()
 
     with pytest.raises(SystemExit):
-        cli.cmd_forward_up(Args(ports=["8765"], remote=None, node=None, name=None), cfg())
+        cli.cmd_forward_up(Args(ports=["8765"], remote=None, node=None, name=None, reverse=False), cfg())
 
     assert ssh.forwards == []
 
